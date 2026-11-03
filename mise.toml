@@ -53,9 +53,15 @@ description = "Check that the crate builds on its minimum supported Rust"
 run = "mise x rust@1.88.0 -- cargo check --all-features --lib"
 
 [tasks.tofu-check]
-description = "Validate and test the OpenTofu module with a mocked provider"
+description = "Validate the OpenTofu module and its example, and test it with a mocked provider"
 dir = "opentofu"
-run = ["tofu init -backend=false -input=false", "tofu validate", "tofu test"]
+run = [
+  "tofu init -backend=false -input=false",
+  "tofu validate",
+  "tofu test",
+  "tofu -chdir=examples/mcp-portal init -backend=false -input=false",
+  "tofu -chdir=examples/mcp-portal validate",
+]
 
 [tasks.package]
 description = "Build the crate as crates.io would receive it"

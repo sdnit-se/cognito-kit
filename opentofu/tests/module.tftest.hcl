@@ -1,0 +1,100 @@
+# What Cognito, an MCP client and an attacker would notice about the planned
+# pool. The provider is mocked, so this runs without AWS credentials.
+
+mock_provider "aws" {
+  mock_data "aws_region" {
+    defaults = { region = "eu-north-1" }
+  }
+}
+
+variables {
+  name   = "test"
+  domain = { prefix = "cognito-kit-test" }
+  resource_server = {
+    identifier = "https://portal.example.com/mcp"
+    scopes     = { drafts = "Create and edit drafts" }
+  }
+  clients = {
+    web = {
+      confidential       = true
+      callback_urls      = ["https://portal.example.com/auth/callback"]
+      identity_providers = ["COGNITO"]
+      scopes             = ["openid", "email"]
+    }
+    claude = {
+      callback_urls      = ["https://claude.ai/api/mcp/auth_callback"]
+      identity_providers = ["Google"]
+      scopes             = ["openid", "https://portal.example.com/mcp/drafts"]
+    }
+  }
+  google = { client_id = "example.apps.googleusercontent.com" }
+}
+
+run "every_client_rotates_refresh_tokens" {
+  command = plan
+
+  assert {
+    condition     = alltrue([for c in aws_cognito_user_pool_client.this : c.refresh_token_rotation[0].feature == "ENABLED"])
+    error_message = "A client without rotation lets a stolen refresh token live for its whole validity."
+  }
+
+  assert {
+    condition     = alltrue([for c in aws_cognito_user_pool_client.this : !contains(c.explicit_auth_flows, "ALLOW_REFRESH_TOKEN_AUTH")])
+    error_message = "Cognito rotates only when ALLOW_REFRESH_TOKEN_AUTH is off."
+  }
+}
+
+run "assistants_are_public_clients_on_the_code_grant" {
+  command = plan
+
+  assert {
+    condition     = aws_cognito_user_pool_client.this["claude"].generate_secret == false && aws_cognito_user_pool_client.this["web"].generate_secret == true
+    error_message = "MCP clients authenticate with PKCE alone (token_endpoint_auth_methods_supported is none)."
+  }
+
+  assert {
+    condition     = alltrue([for c in aws_cognito_user_pool_client.this : c.allowed_oauth_flows == toset(["code"])])
+    error_message = "Only the authorization code grant; never implicit."
+  }
+}
+
+run "managed_login_is_version_2_and_branded_per_client" {
+  command = plan
+
+  assert {
+    condition     = aws_cognito_user_pool_domain.this.managed_login_version == 2
+    error_message = "Branding needs managed login v2."
+  }
+
+  assert {
+    condition     = length(aws_cognito_managed_login_branding.this) == 2
+    error_message = "Each app client has its own branding style."
+  }
+}
+
+run "refuses_the_refresh_token_auth_flow" {
+  command = plan
+
+  variables {
+    clients = {
+      legacy = {
+        callback_urls       = ["https://app.example.com/callback"]
+        identity_providers  = ["COGNITO"]
+        scopes              = ["openid"]
+        explicit_auth_flows = ["ALLOW_REFRESH_TOKEN_AUTH", "ALLOW_USER_SRP_AUTH"]
+      }
+    }
+  }
+
+  expect_failures = [var.clients]
+}
+
+run "refuses_an_ambiguous_domain" {
+  command = plan
+
+  variables {
+    domain = { prefix = "cognito-kit-test", name = "login.example.com" }
+  }
+
+  expect_failures = [var.domain]
+}
