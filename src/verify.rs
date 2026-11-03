@@ -128,9 +128,6 @@ async fn decode<T: DeserializeOwned>(
     leeway: Duration,
 ) -> Result<T, Rejection> {
     let header = jsonwebtoken::decode_header(token).map_err(|_| Rejection::Malformed)?;
-    if header.alg != Algorithm::RS256 {
-        return Err(Rejection::Algorithm);
-    }
     let kid = header.kid.ok_or(Rejection::Malformed)?;
     let key = pool.keys().key(&kid).await?;
     let mut validation = Validation::new(Algorithm::RS256);
