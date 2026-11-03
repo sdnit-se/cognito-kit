@@ -74,8 +74,9 @@
 //! // The OAuth front for MCP servers
 //! OAuthFront::new(AccessTokenVerifier, LoginDomain) -> Result<OAuthFront, ConfigError>
 //! OAuthFront::respond(&self, &Method, path: &str) -> Option<http::Response<String>>
-//! OAuthFront::protected_resource_metadata(&self) -> ProtectedResourceMetadata
-//! OAuthFront::authorization_server_metadata(&self) -> AuthorizationServerMetadata
+//! OAuthFront::paths(&self) -> impl Iterator<Item = &str>
+//! OAuthFront::protected_resource_metadata(&self) -> &ProtectedResourceMetadata
+//! OAuthFront::authorization_server_metadata(&self) -> &AuthorizationServerMetadata
 //! OAuthFront::verifier(&self) -> &AccessTokenVerifier
 //!
 //! // Adapters

@@ -1,4 +1,4 @@
-use http::{HeaderValue, Method, StatusCode, header};
+use http::{HeaderValue, Method, header};
 use serde::Serialize;
 
 use crate::config::{ConfigError, LoginDomain, Scope};
@@ -65,8 +65,6 @@ pub struct OAuthFront {
     resource_metadata: ProtectedResourceMetadata,
     authorization_server_metadata: AuthorizationServerMetadata,
     resource_paths: Vec<String>,
-    resource_body: String,
-    authorization_server_body: String,
 }
 
 fn strings<'a>(items: impl IntoIterator<Item = &'a str>) -> Vec<String> {
@@ -108,9 +106,6 @@ impl OAuthFront {
             resource_paths.push(PROTECTED_RESOURCE.to_owned());
         }
         Ok(Self {
-            resource_body: serde_json::to_string(&resource_metadata).expect("metadata serializes"),
-            authorization_server_body: serde_json::to_string(&authorization_server_metadata)
-                .expect("metadata serializes"),
             verifier,
             resource_metadata,
             authorization_server_metadata,
@@ -142,14 +137,13 @@ impl OAuthFront {
             return None;
         }
         let body = if path == AUTHORIZATION_SERVER {
-            &self.authorization_server_body
+            serde_json::to_string(&self.authorization_server_metadata)
         } else if self.resource_paths.iter().any(|p| p == path) {
-            &self.resource_body
+            serde_json::to_string(&self.resource_metadata)
         } else {
             return None;
         };
-        let mut response = http::Response::new(body.clone());
-        *response.status_mut() = StatusCode::OK;
+        let mut response = http::Response::new(body.expect("metadata serializes"));
         let headers = response.headers_mut();
         headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
         headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));

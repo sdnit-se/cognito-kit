@@ -109,8 +109,12 @@ impl Challenge {
 
     /// The response to send.
     pub fn response(self) -> http::Response<String> {
+        let fallback = match self.rejection {
+            Rejection::KeysUnavailable(_) => "temporarily_unavailable",
+            _ => "unauthorized",
+        };
         let body = serde_json::json!({
-            "error": self.rejection.code().unwrap_or("unauthorized"),
+            "error": self.rejection.code().unwrap_or(fallback),
             "error_description": self.rejection.to_string(),
         });
         let mut response = http::Response::new(body.to_string());
