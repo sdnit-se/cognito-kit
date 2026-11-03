@@ -72,7 +72,8 @@ impl UserPool {
     }
 
     /// How long fetched keys are trusted before the next check refetches
-    /// them. Defaults to ten minutes.
+    /// them. Defaults to ten minutes. Stale keys are never used: while the
+    /// refetch fails, checks fail with 503.
     ///
     /// Call it before building verifiers: it starts a new, empty key cache.
     #[must_use]

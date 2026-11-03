@@ -15,6 +15,7 @@ use support::{CLIENT, FakeCognito, KEYS, access_claims, id_claims, now, sign};
 
 const MCP: &str = "https://portal.example.com/mcp";
 const DRAFTS: &str = "https://portal.example.com/mcp/drafts";
+const KEY_AGE: Duration = Duration::from_millis(50);
 
 fn verifier(pool: &UserPool) -> AccessTokenVerifier {
     pool.access_tokens()
@@ -167,15 +168,32 @@ async fn stops_accepting_a_withdrawn_key_once_the_keys_are_stale() {
     let pool = cognito
         .pool()
         .refetch_cooldown(Duration::ZERO)
-        .max_key_age(Duration::ZERO);
+        .max_key_age(KEY_AGE);
     let verifier = verifier(&pool);
     let token = sign("k2", &access_claims(MCP, DRAFTS));
     verifier.verify::<()>(&token).await.unwrap();
     cognito.publish(&["k1"]);
+    tokio::time::sleep(KEY_AGE * 2).await;
     assert!(matches!(
         verifier.verify::<()>(&token).await,
         Err(Rejection::UnknownKey)
     ));
+}
+
+#[tokio::test]
+async fn never_trusts_stale_keys_while_cognito_is_unreachable() {
+    let cognito = FakeCognito::publishing(&["k1"]);
+    let pool = cognito
+        .pool()
+        .refetch_cooldown(Duration::ZERO)
+        .max_key_age(KEY_AGE);
+    let verifier = verifier(&pool);
+    let token = sign("k1", &access_claims(MCP, DRAFTS));
+    verifier.verify::<()>(&token).await.unwrap();
+    cognito.fail_jwks_with(500);
+    tokio::time::sleep(KEY_AGE * 2).await;
+    let rejection = verifier.verify::<()>(&token).await.unwrap_err();
+    assert_eq!(rejection.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
 #[tokio::test]

@@ -113,7 +113,8 @@
 //! at most once per cooldown (30 seconds by default), so a stream of forged
 //! key ids can't turn the service into a JWKS fetcher. Keys older than ten
 //! minutes are refetched on the next check, so a key that Cognito withdraws
-//! stops working.
+//! stops working. Until a refetch succeeds, stale keys aren't used, and
+//! checks fail with 503.
 //!
 //! # Custom attributes
 //!

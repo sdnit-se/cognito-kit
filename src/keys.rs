@@ -76,8 +76,9 @@ impl KeyCache {
                 Err(error) => attempt.error = Some(Arc::new(error)),
             }
         }
-        // A failed refetch keeps the keys already known, stale or not.
-        match self.current() {
+        // Stale keys are never used, even while a refetch fails: a key that
+        // Cognito withdrew must stop working.
+        match self.current().filter(|set| set.fetched.elapsed() < self.max_age) {
             Some(set) => set.keys.get(kid).cloned().ok_or(Rejection::UnknownKey),
             None => Err(attempt
                 .error

@@ -45,7 +45,7 @@ resource "aws_cognito_identity_provider" "google" {
 
   provider_details = {
     client_id        = var.google.client_id
-    client_secret    = coalesce(var.google.client_secret, "set-out-of-band")
+    client_secret    = sensitive(coalesce(var.google.client_secret, "set-out-of-band"))
     authorize_scopes = join(" ", var.google.scopes)
   }
 
