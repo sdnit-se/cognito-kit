@@ -203,3 +203,21 @@ fn never_prints_secrets() {
     );
     assert!(!printed.contains("s3cret") && !printed.contains("first"));
 }
+
+#[test]
+fn its_futures_can_run_on_any_thread() {
+    fn send<T: Send>(_: T) {}
+    let cognito = FakeCognito::default();
+    let login = login(&cognito);
+    let (_, pending) = login.authorize(&AuthorizeOptions::default());
+    send(login.callback::<()>(pending, ""));
+    send(login.refresh::<()>(&RefreshToken::new("first")));
+    send(login.revoke(&RefreshToken::new("first")));
+    let verifier = cognito
+        .pool()
+        .access_tokens()
+        .client(CLIENT.parse().unwrap())
+        .build()
+        .unwrap();
+    send(verifier.verify::<()>(""));
+}

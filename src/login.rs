@@ -26,10 +26,12 @@ macro_rules! secret {
         pub struct $name(String);
 
         impl $name {
+            /// Wraps a value received from Cognito or loaded from storage.
             pub fn new(secret: impl Into<String>) -> Self {
                 Self(secret.into())
             }
 
+            /// The value itself. Don't log it.
             pub fn secret(&self) -> &str {
                 &self.0
             }
@@ -86,6 +88,7 @@ pub struct AuthorizeOptions {
 }
 
 impl AuthorizeOptions {
+    /// Goes straight to this identity provider, such as `Google`.
     #[must_use]
     pub fn identity_provider(mut self, name: impl Into<String>) -> Self {
         self.identity_provider = Some(name.into());
@@ -97,7 +100,9 @@ impl AuthorizeOptions {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Tokens {
+    /// The ID token, already verified.
     pub id_token: IdToken,
+    /// The access token, for calling APIs that accept this pool's tokens.
     pub access_token: AccessToken,
     /// From a sign-in, if the app client allows refresh; from a refresh, if
     /// rotation is on. Keep the newest one.
@@ -110,7 +115,9 @@ pub struct Tokens {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct SignedIn<C = ()> {
+    /// The verified ID token's claims.
     pub claims: IdClaims<C>,
+    /// The tokens Cognito issued.
     pub tokens: Tokens,
 }
 
@@ -119,6 +126,7 @@ pub struct SignedIn<C = ()> {
 pub struct OAuthError {
     /// The RFC 6749 code, such as `access_denied` or `invalid_grant`.
     pub error: String,
+    /// Cognito's explanation, if it gave one.
     #[serde(default)]
     pub error_description: Option<String>,
 }
@@ -151,13 +159,16 @@ pub enum LoginError {
     /// Managed login sent the user back with an error, such as `access_denied`.
     #[error("sign-in was refused: {0}")]
     Denied(OAuthError),
+    /// The callback has neither a code nor an error.
     #[error("the callback has neither a code nor an error")]
     NoCode,
     /// The token or revocation endpoint refused the request.
     #[error("the token endpoint refused: {0}")]
     Refused(OAuthError),
+    /// Cognito could not be reached, or answered with something that isn't OAuth.
     #[error("Cognito could not be reached or answered unexpectedly")]
     Http(#[source] Arc<BoxError>),
+    /// The ID token from the token endpoint failed verification.
     #[error("the ID token was refused: {0}")]
     IdToken(#[source] Rejection),
     /// The ID token's nonce isn't this sign-in's: a replayed token.
@@ -208,6 +219,7 @@ impl ManagedLoginBuilder {
         self
     }
 
+    /// Checks the redirect URI: https, or http on localhost.
     pub fn build(self) -> Result<ManagedLogin, ConfigError> {
         check_url(&self.redirect_uri)?;
         let mut scopes = vec!["openid"];
@@ -381,9 +393,11 @@ impl ManagedLogin {
     }
 
     async fn post(&self, path: &str, form: &[(&str, &str)]) -> Result<Vec<u8>, LoginError> {
-        let mut body = form_urlencoded::Serializer::new(String::new());
-        body.extend_pairs(form)
-            .append_pair("client_id", self.client.as_str());
+        // The serializer isn't Send, so it must not live across an await.
+        let body = form_urlencoded::Serializer::new(String::new())
+            .extend_pairs(form)
+            .append_pair("client_id", self.client.as_str())
+            .finish();
         let mut request = http::Request::post(self.domain.endpoint(path).as_str())
             .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
             .header(header::ACCEPT, "application/json");
@@ -394,9 +408,7 @@ impl ManagedLogin {
             value.set_sensitive(true);
             request = request.header(header::AUTHORIZATION, value);
         }
-        let request = request
-            .body(body.finish().into_bytes())
-            .map_err(LoginError::http)?;
+        let request = request.body(body.into_bytes()).map_err(LoginError::http)?;
         let response = self
             .http
             .send(request)

@@ -61,3 +61,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 [[example]]
 name = "portal"
 required-features = ["axum", "reqwest"]
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"

@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use serde::de::DeserializeOwned;
 
+/// The error an [`HttpClient`] returns.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Sends the few HTTP requests this crate makes: the pool's key set, and
@@ -12,6 +13,8 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// With the `reqwest` feature, [`reqwest::Client`] implements it. Implement it
 /// yourself to use another client, or to answer from memory in tests.
 pub trait HttpClient: Send + Sync + 'static {
+    /// Sends one request and returns the whole response, whatever its
+    /// status. An error means no response arrived.
     fn send(
         &self,
         request: http::Request<Vec<u8>>,

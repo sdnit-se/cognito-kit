@@ -18,6 +18,7 @@ pub struct RequireBearerLayer<C = ()> {
 }
 
 impl<C> RequireBearerLayer<C> {
+    /// Checks every request with `verifier`.
     pub fn new(verifier: AccessTokenVerifier) -> Self {
         Self {
             verifier,

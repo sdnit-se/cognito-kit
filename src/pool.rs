@@ -37,6 +37,8 @@ impl UserPool {
         Self::with_http_client(id, crate::http_client::default_client())
     }
 
+    /// A pool whose keys are fetched, and whose token endpoint is called, with
+    /// your own HTTP client.
     pub fn with_http_client(id: PoolId, http: impl HttpClient) -> Self {
         // With exactly one of jsonwebtoken's crypto features on, it picks a
         // provider by itself. Feature unification can turn on both, and then
@@ -91,6 +93,7 @@ impl UserPool {
         }
     }
 
+    /// The pool's id.
     pub fn id(&self) -> &PoolId {
         &self.inner.id
     }
@@ -101,10 +104,12 @@ impl UserPool {
         &self.inner.issuer
     }
 
+    /// A verifier for access tokens, for a service that the pool protects.
     pub fn access_tokens(&self) -> AccessTokenVerifierBuilder {
         AccessTokenVerifierBuilder::new(self.clone())
     }
 
+    /// A verifier for ID tokens issued to `client`.
     pub fn id_tokens(&self, client: ClientId) -> IdTokenVerifier {
         IdTokenVerifier::new(self.clone(), client)
     }

@@ -12,6 +12,7 @@ use crate::config::{ClientId, Scope};
 pub struct Sub(String);
 
 impl Sub {
+    /// The identifier, usually a UUID.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -28,10 +29,12 @@ impl fmt::Display for Sub {
 pub struct Scopes(BTreeSet<Scope>);
 
 impl Scopes {
+    /// Whether the token grants `scope`.
     pub fn contains(&self, scope: &Scope) -> bool {
         self.0.contains(scope)
     }
 
+    /// The granted scopes, in order.
     pub fn iter(&self) -> impl Iterator<Item = &Scope> {
         self.0.iter()
     }
@@ -54,22 +57,30 @@ impl<'de> Deserialize<'de> for Scopes {
 #[derive(Debug, Clone, Deserialize)]
 #[non_exhaustive]
 pub struct AccessClaims<C = ()> {
+    /// The user, or for a machine-to-machine token the app client.
     pub sub: Sub,
+    /// The app client the token was issued to.
     pub client_id: ClientId,
     /// Absent from machine-to-machine tokens.
     #[serde(default)]
     pub username: Option<String>,
+    /// The user's groups in the pool (`cognito:groups`).
     #[serde(default, rename = "cognito:groups")]
     pub groups: Vec<String>,
+    /// The granted scopes (`scope`).
     #[serde(default, rename = "scope")]
     pub scopes: Scopes,
     /// Expiry, in seconds since the Unix epoch.
     pub exp: u64,
+    /// Issue time, in seconds since the Unix epoch.
     pub iat: u64,
+    /// When the user signed in, in seconds since the Unix epoch.
     #[serde(default)]
     pub auth_time: Option<u64>,
+    /// The token's unique id.
     #[serde(default)]
     pub jti: Option<String>,
+    /// The claims this struct doesn't name.
     #[serde(flatten)]
     pub custom: C,
 }
@@ -81,25 +92,37 @@ pub struct AccessClaims<C = ()> {
 #[derive(Debug, Clone, Deserialize)]
 #[non_exhaustive]
 pub struct IdClaims<C = ()> {
+    /// The user.
     pub sub: Sub,
+    /// The user's name in the pool (`cognito:username`). For a federated
+    /// user it is `<provider>_<id at the provider>`, such as `google_1234`.
     #[serde(rename = "cognito:username")]
     pub username: String,
+    /// The user's email address, if the app client may read it.
     #[serde(default)]
     pub email: Option<String>,
+    /// Whether the email address is verified. For a federated user, it is
+    /// what the provider said, through the pool's attribute mapping.
     #[serde(default, deserialize_with = "lenient_bool")]
     pub email_verified: bool,
+    /// The user's full name.
     #[serde(default)]
     pub name: Option<String>,
+    /// The user's groups in the pool (`cognito:groups`).
     #[serde(default, rename = "cognito:groups")]
     pub groups: Vec<String>,
     /// The external identity providers linked to this user, such as Google.
     /// Empty for users who sign in with the pool's own credentials.
     #[serde(default)]
     pub identities: Vec<Identity>,
+    /// Expiry, in seconds since the Unix epoch.
     pub exp: u64,
+    /// Issue time, in seconds since the Unix epoch.
     pub iat: u64,
+    /// When the user signed in, in seconds since the Unix epoch.
     #[serde(default)]
     pub auth_time: Option<u64>,
+    /// The claims this struct doesn't name.
     #[serde(flatten)]
     pub custom: C,
     #[serde(default)]

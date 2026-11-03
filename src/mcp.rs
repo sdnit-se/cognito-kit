@@ -11,9 +11,13 @@ const AUTHORIZATION_SERVER: &str = "/.well-known/oauth-authorization-server";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
 pub struct ProtectedResourceMetadata {
+    /// The resource's URL; a client checks that it is the URL it called.
     pub resource: String,
+    /// The issuer of the authorization server metadata: the resource's origin.
     pub authorization_servers: Vec<String>,
+    /// The scopes a token needs; clients ask for these.
     pub scopes_supported: Vec<String>,
+    /// `header`: tokens go in `Authorization: Bearer`.
     pub bearer_methods_supported: Vec<String>,
 }
 
@@ -23,16 +27,28 @@ pub struct ProtectedResourceMetadata {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
 pub struct AuthorizationServerMetadata {
+    /// The resource's origin. It must equal the URL the document is read from,
+    /// minus the well-known path (RFC 8414 section 3.3).
     pub issuer: String,
+    /// Managed login's `/oauth2/authorize`.
     pub authorization_endpoint: String,
+    /// Managed login's `/oauth2/token`.
     pub token_endpoint: String,
+    /// Managed login's `/oauth2/revoke`.
     pub revocation_endpoint: String,
+    /// `code`.
     pub response_types_supported: Vec<String>,
+    /// `query`.
     pub response_modes_supported: Vec<String>,
+    /// `authorization_code` and `refresh_token`.
     pub grant_types_supported: Vec<String>,
+    /// `S256`, which Cognito supports but doesn't advertise.
     pub code_challenge_methods_supported: Vec<String>,
+    /// `none`: the assistants' app clients are public and use PKCE.
     pub token_endpoint_auth_methods_supported: Vec<String>,
+    /// `none`, as for the token endpoint.
     pub revocation_endpoint_auth_methods_supported: Vec<String>,
+    /// The resource's scopes.
     pub scopes_supported: Vec<String>,
 }
 
@@ -102,14 +118,19 @@ impl OAuthFront {
         })
     }
 
+    /// The verifier for the resource's tokens.
     pub fn verifier(&self) -> &AccessTokenVerifier {
         &self.verifier
     }
 
+    /// The document [`respond`](Self::respond) serves at the protected
+    /// resource paths.
     pub fn protected_resource_metadata(&self) -> &ProtectedResourceMetadata {
         &self.resource_metadata
     }
 
+    /// The document [`respond`](Self::respond) serves at
+    /// `/.well-known/oauth-authorization-server`.
     pub fn authorization_server_metadata(&self) -> &AuthorizationServerMetadata {
         &self.authorization_server_metadata
     }

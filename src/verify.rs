@@ -20,28 +20,41 @@ const DEFAULT_LEEWAY: Duration = Duration::from_secs(60);
 #[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum Rejection {
+    /// The request has no `Authorization: Bearer` header.
     #[error("no bearer token")]
     Missing,
+    /// Not a JWT, no key id, or claims of the wrong shape (including a
+    /// custom attribute type that doesn't match).
     #[error("the token is not a well-formed Cognito JWT")]
     Malformed,
+    /// Signed with something other than RS256, such as `none` or HS256.
     #[error("the token is not signed with RS256")]
     Algorithm,
+    /// The pool doesn't publish the token's key, even after a refetch.
     #[error("the token is signed with a key the pool doesn't publish")]
     UnknownKey,
+    /// The signature doesn't match the token.
     #[error("the token's signature is invalid")]
     Signature,
+    /// Expired, beyond the leeway.
     #[error("the token has expired")]
     Expired,
+    /// Issued by another pool, or by something that isn't Cognito.
     #[error("the token is from another issuer")]
     Issuer,
+    /// An ID token where an access token belongs, or the reverse.
     #[error("the token is the wrong kind: an ID token where an access token belongs, or the reverse")]
     TokenUse,
+    /// `aud` is missing or names another resource or client.
     #[error("the token is for another audience")]
     Audience,
+    /// Issued to an app client the verifier doesn't accept.
     #[error("the token was issued to an app client this service doesn't accept")]
     Client,
+    /// The token lacks a required scope. Answered with 403.
     #[error("the token lacks the scope {0}")]
     Scope(Scope),
+    /// The pool's keys could not be fetched. Answered with 503.
     #[error("the pool's signing keys could not be fetched")]
     KeysUnavailable(#[source] Arc<BoxError>),
 }
@@ -89,10 +102,12 @@ pub struct Challenge {
 }
 
 impl Challenge {
+    /// Why the request was refused, for logs.
     pub fn rejection(&self) -> &Rejection {
         &self.rejection
     }
 
+    /// The response to send.
     pub fn response(self) -> http::Response<String> {
         let body = serde_json::json!({
             "error": self.rejection.code().unwrap_or("unauthorized"),
@@ -209,6 +224,7 @@ impl AccessTokenVerifierBuilder {
         self
     }
 
+    /// Accepts tokens issued to each of these app clients.
     pub fn clients(mut self, clients: impl IntoIterator<Item = ClientId>) -> Self {
         self.clients.extend(clients);
         self
@@ -246,6 +262,8 @@ impl AccessTokenVerifierBuilder {
         self
     }
 
+    /// Checks the settings: at least one client, and an https audience (or
+    /// http on localhost).
     pub fn build(self) -> Result<AccessTokenVerifier, ConfigError> {
         if self.clients.is_empty() {
             return Err(ConfigError::NoClients);
@@ -264,6 +282,8 @@ impl AccessTokenVerifierBuilder {
 }
 
 impl AccessTokenVerifier {
+    /// Verifies an access token: its signature against the pool's keys, its
+    /// issuer, expiry, kind, app client, audience and scopes.
     pub async fn verify<C: DeserializeOwned>(&self, token: &str) -> Result<AccessClaims<C>, Rejection> {
         let audience = self.audience.url().map(canonical);
         let claims: AccessClaims<C> =
@@ -390,6 +410,8 @@ impl IdTokenVerifier {
         self
     }
 
+    /// Verifies an ID token: its signature, issuer, expiry, kind, and that
+    /// its `aud` is this verifier's app client.
     pub async fn verify<C: DeserializeOwned>(&self, token: &str) -> Result<IdClaims<C>, Rejection> {
         decode(&self.pool, token, "id", Some(self.client.as_str()), self.leeway).await
     }

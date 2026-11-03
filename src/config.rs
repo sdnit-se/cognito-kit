@@ -8,16 +8,27 @@ use url::Url;
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ConfigError {
+    /// Not a user pool id.
     #[error("{0:?} is not a user pool id such as eu-north-1_AbC123")]
     PoolId(String),
+    /// Not an app client id.
     #[error("{0:?} is not an app client id")]
     ClientId(String),
+    /// Not an RFC 6749 scope.
     #[error("{0:?} is not an OAuth scope")]
     Scope(String),
+    /// A URL this crate can't use, and why.
     #[error("{url}: {reason}")]
-    Url { url: String, reason: &'static str },
+    Url {
+        /// The URL as given.
+        url: String,
+        /// What is wrong with it.
+        reason: &'static str,
+    },
+    /// An access-token verifier was built without an app client.
     #[error("an access-token verifier needs at least one app client")]
     NoClients,
+    /// An OAuth front was given a verifier without a resource.
     #[error("the OAuth front needs a verifier built with `resource`")]
     NoResource,
 }
@@ -34,10 +45,12 @@ fn url_error(url: &str, reason: &'static str) -> ConfigError {
 pub struct PoolId(String);
 
 impl PoolId {
+    /// The id as Cognito shows it.
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
+    /// The AWS region the pool lives in, such as `eu-north-1`.
     pub fn region(&self) -> &str {
         self.0.split_once('_').map_or("", |(region, _)| region)
     }
@@ -80,6 +93,7 @@ impl fmt::Display for PoolId {
 pub struct ClientId(String);
 
 impl ClientId {
+    /// The id as Cognito shows it.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -119,6 +133,7 @@ impl PartialEq<str> for ClientId {
 pub struct Scope(String);
 
 impl Scope {
+    /// The scope as it appears in a token's `scope` claim.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -155,6 +170,7 @@ impl fmt::Display for Scope {
 pub struct LoginDomain(Url);
 
 impl LoginDomain {
+    /// The origin, as a URL.
     pub fn url(&self) -> &Url {
         &self.0
     }
