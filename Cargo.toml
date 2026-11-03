@@ -11,7 +11,7 @@ documentation = "https://docs.rs/cognito-kit"
 readme = "README.md"
 keywords = ["cognito", "jwt", "oauth", "oidc", "mcp"]
 categories = ["authentication", "web-programming"]
-include = ["/src", "/README.md", "/LICENSE", "/SECURITY.md"]
+include = ["/src", "/examples", "/README.md", "/CHANGELOG.md", "/LICENSE", "/SECURITY.md"]
 
 [features]
 default = ["reqwest"]

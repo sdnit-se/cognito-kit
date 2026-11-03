@@ -13,6 +13,7 @@ rust = { version = "1.99.1", profile = "minimal", components = "rustfmt,clippy" 
 opentofu = "1.13.1"
 bun = "1.4.4"
 actionlint = "1.7.12"
+zizmor = "1.30.1"
 
 [tasks.fmt]
 description = "Format Rust and OpenTofu files"
@@ -69,7 +70,7 @@ run = "cargo publish --dry-run"
 
 [tasks.lint-workflows]
 description = "Lint the GitHub Actions workflows"
-run = "actionlint"
+run = ["actionlint", "zizmor --offline .github/workflows"]
 
 [tasks.ci]
 description = "Run everything CI runs"
