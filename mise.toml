@@ -1,0 +1,78 @@
+# Every tool and task for cognito-kit. `mise run ci` runs what CI runs.
+min_version = "2026.10.7"
+
+[settings]
+lockfile = true
+
+[env]
+CARGO_TERM_COLOR = "always"
+
+[tools]
+# The toolchain for development and CI; the MSRV is checked with rust@1.88.0.
+rust = { version = "1.99.1", profile = "minimal", components = "rustfmt,clippy" }
+opentofu = "1.13.1"
+bun = "1.4.4"
+actionlint = "1.7.12"
+
+[tasks.fmt]
+description = "Format Rust and OpenTofu files"
+run = ["cargo fmt", "tofu fmt -recursive opentofu"]
+
+[tasks.fmt-check]
+description = "Fail on unformatted Rust or OpenTofu files"
+run = ["cargo fmt --check", "tofu fmt -check -recursive opentofu"]
+
+[tasks.lint]
+description = "Clippy over every feature combination that matters"
+run = [
+  "cargo clippy --all-targets --no-default-features -- -D warnings",
+  "cargo clippy --all-targets -- -D warnings",
+  "cargo clippy --all-targets --no-default-features --features axum -- -D warnings",
+  "cargo clippy --all-targets --no-default-features --features tower -- -D warnings",
+  "cargo clippy --all-targets --all-features -- -D warnings",
+]
+
+[tasks.test]
+description = "Tests over every feature combination that matters"
+run = [
+  "cargo test --no-default-features",
+  "cargo test",
+  "cargo test --no-default-features --features axum",
+  "cargo test --no-default-features --features tower",
+  "cargo test --all-features",
+]
+
+[tasks.doc]
+description = "Build the docs as docs.rs does, failing on warnings"
+env = { RUSTDOCFLAGS = "-D warnings" }
+run = "cargo doc --no-deps --all-features"
+
+[tasks.msrv]
+description = "Check that the crate builds on its minimum supported Rust"
+run = "mise x rust@1.88.0 -- cargo check --all-features --lib"
+
+[tasks.tofu-check]
+description = "Validate and test the OpenTofu module with a mocked provider"
+dir = "opentofu"
+run = ["tofu init -backend=false -input=false", "tofu validate", "tofu test"]
+
+[tasks.package]
+description = "Build the crate as crates.io would receive it"
+run = "cargo publish --dry-run"
+
+[tasks.lint-workflows]
+description = "Lint the GitHub Actions workflows"
+run = "actionlint"
+
+[tasks.ci]
+description = "Run everything CI runs"
+run = [
+  "mise run fmt-check",
+  "mise run lint",
+  "mise run test",
+  "mise run doc",
+  "mise run msrv",
+  "mise run tofu-check",
+  "mise run lint-workflows",
+  "mise run package",
+]

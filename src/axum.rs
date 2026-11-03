@@ -1,0 +1,50 @@
+use axum::extract::{FromRef, FromRequestParts};
+use axum::response::{IntoResponse, Response};
+use http::request::Parts;
+use http::{Method, StatusCode};
+use serde::de::DeserializeOwned;
+
+use crate::{AccessClaims, AccessTokenVerifier, Challenge, OAuthFront};
+
+impl IntoResponse for Challenge {
+    fn into_response(self) -> Response {
+        self.response().into_response()
+    }
+}
+
+/// Handlers take `AccessClaims<C>` as an argument; the token is verified by
+/// the state's [`AccessTokenVerifier`], and a refused request gets the
+/// verifier's [`Challenge`].
+impl<S, C> FromRequestParts<S> for AccessClaims<C>
+where
+    AccessTokenVerifier: FromRef<S>,
+    S: Send + Sync,
+    C: DeserializeOwned,
+{
+    type Rejection = Challenge;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        AccessTokenVerifier::from_ref(state)
+            .authenticate(&parts.headers)
+            .await
+    }
+}
+
+impl OAuthFront {
+    /// Routes for the metadata documents, to merge into your router.
+    #[cfg_attr(docsrs, doc(cfg(feature = "axum")))]
+    pub fn router<S: Clone + Send + Sync + 'static>(&self) -> axum::Router<S> {
+        self.paths().fold(axum::Router::new(), |router, path| {
+            let front = self.clone();
+            let owned = path.to_owned();
+            let respond = move || {
+                let response = front.respond(&Method::GET, &owned);
+                std::future::ready(response.map_or_else(
+                    || StatusCode::NOT_FOUND.into_response(),
+                    IntoResponse::into_response,
+                ))
+            };
+            router.route(path, axum::routing::get(respond))
+        })
+    }
+}
