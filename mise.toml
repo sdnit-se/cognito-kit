@@ -34,11 +34,12 @@ run = [
 
 [tasks.test]
 description = "Tests over every feature combination that matters"
+# The doc examples use the default HTTP client, so they run with reqwest on.
 run = [
-  "cargo test --no-default-features",
+  "cargo test --no-default-features --lib --tests",
   "cargo test",
-  "cargo test --no-default-features --features axum",
-  "cargo test --no-default-features --features tower",
+  "cargo test --no-default-features --features axum --lib --tests",
+  "cargo test --no-default-features --features tower --lib --tests",
   "cargo test --all-features",
 ]
 
