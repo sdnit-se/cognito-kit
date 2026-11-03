@@ -151,7 +151,9 @@ async fn refresh(State(app): State<App>, headers: HeaderMap) -> Response {
 async fn logout(State(app): State<App>, headers: HeaderMap) -> impl IntoResponse {
     let session = cookie(&headers, "session").and_then(|id| app.sessions.lock().unwrap().remove(id));
     if let Some(refresh) = session.and_then(|s| s.tokens.refresh_token) {
-        let _ = app.login.revoke(&refresh).await;
+        if let Err(error) = app.login.revoke(&refresh).await {
+            eprintln!("revoking the refresh token failed: {error}");
+        }
     }
     Redirect::to(app.login.logout_url(&app.public_url).as_str())
 }

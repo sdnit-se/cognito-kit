@@ -37,6 +37,16 @@ const mcp = (token?: string, id = 1) =>
     body: JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name: 'whoami' } }),
   });
 
+// The loopback listener a CLI assistant runs for its callback.
+let onCallback = (_: Record<string, string>) => {};
+const listener = Bun.serve({
+  port: 8765,
+  fetch(request) {
+    onCallback(Object.fromEntries(new URL(request.url).searchParams));
+    return new Response('ok');
+  },
+});
+
 const browser = await chromium.launch();
 try {
   const context = await browser.newContext();
@@ -71,16 +81,10 @@ try {
     };
     if (resource) params.resource = prm.resource;
     for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
-    let gotCode: (p: Record<string, string>) => void;
-    const arrived = new Promise<Record<string, string>>((resolve) => (gotCode = resolve));
-    await page.route((u: URL) => u.href.startsWith(REDIRECT), (route: any) => {
-      gotCode(Object.fromEntries(new URL(route.request().url()).searchParams));
-      return route.fulfill({ body: 'ok' });
-    });
+    const arrived = new Promise<Record<string, string>>((resolve) => (onCallback = resolve));
     await page.goto(url.toString());
     const formShown = await Promise.race([arrived.then(() => false), signInIfAsked(page)]);
     const callback = await Promise.race([arrived, new Promise<never>((_, r) => setTimeout(() => r(new Error('no callback')), 20_000))]);
-    await page.unroute((u: URL) => u.href.startsWith(REDIRECT));
     const body = new URLSearchParams({ grant_type: 'authorization_code', code: callback.code, redirect_uri: REDIRECT, client_id: CLIENT, code_verifier: verifier });
     if (resource) body.set('resource', prm.resource);
     const response = await fetch(asm.token_endpoint, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body });
@@ -127,5 +131,6 @@ try {
   report.failure = (e as Error).message;
 } finally {
   await browser.close();
+  listener.stop(true);
 }
 console.log(JSON.stringify(report, null, 2));
