@@ -66,7 +66,12 @@ impl KeyCache {
         if let Some(key) = self.fresh(kid) {
             return Ok(key);
         }
-        if attempt.at.is_none_or(|at| at.elapsed() >= self.cooldown) {
+        // A set goes stale after max_age, so the cooldown can't be longer, or
+        // a stale set would wait out the cooldown with no usable keys.
+        if attempt
+            .at
+            .is_none_or(|at| at.elapsed() >= self.cooldown.min(self.max_age))
+        {
             attempt.at = Some(Instant::now());
             match self.fetch().await {
                 Ok(set) => {
@@ -80,10 +85,9 @@ impl KeyCache {
         // Cognito withdrew must stop working.
         match self.current().filter(|set| set.fetched.elapsed() < self.max_age) {
             Some(set) => set.keys.get(kid).cloned().ok_or(Rejection::UnknownKey),
-            None => Err(attempt
-                .error
-                .clone()
-                .map_or(Rejection::UnknownKey, Rejection::KeysUnavailable)),
+            None => Err(Rejection::KeysUnavailable(attempt.error.clone().unwrap_or_else(
+                || Arc::new("no key set is younger than max_key_age".into()),
+            ))),
         }
     }
 

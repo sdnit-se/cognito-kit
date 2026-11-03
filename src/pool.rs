@@ -62,7 +62,8 @@ impl UserPool {
         }
     }
 
-    /// The shortest time between two key fetches. Defaults to 30 seconds.
+    /// The shortest time between two key fetches. Defaults to 30 seconds,
+    /// and is never longer than [`max_key_age`](Self::max_key_age).
     ///
     /// Call it before building verifiers: it starts a new, empty key cache.
     #[must_use]

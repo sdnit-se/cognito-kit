@@ -165,19 +165,21 @@ async fn accepts_a_rotated_key_once_the_cooldown_has_passed() {
 #[tokio::test]
 async fn stops_accepting_a_withdrawn_key_once_the_keys_are_stale() {
     let cognito = FakeCognito::publishing(&["k1", "k2"]);
-    let pool = cognito
-        .pool()
-        .refetch_cooldown(Duration::ZERO)
-        .max_key_age(KEY_AGE);
-    let verifier = verifier(&pool);
-    let token = sign("k2", &access_claims(MCP, DRAFTS));
-    verifier.verify::<()>(&token).await.unwrap();
+    let verifier = verifier(&cognito.pool().max_key_age(KEY_AGE));
+    let withdrawn = sign("k2", &access_claims(MCP, DRAFTS));
+    verifier.verify::<()>(&withdrawn).await.unwrap();
     cognito.publish(&["k1"]);
     tokio::time::sleep(KEY_AGE * 2).await;
+    let kept = sign("k1", &access_claims(MCP, DRAFTS));
+    verifier
+        .verify::<()>(&kept)
+        .await
+        .expect("stale keys are refetched within the cooldown");
     assert!(matches!(
-        verifier.verify::<()>(&token).await,
+        verifier.verify::<()>(&withdrawn).await,
         Err(Rejection::UnknownKey)
     ));
+    assert_eq!(cognito.jwks_fetches(), 2);
 }
 
 #[tokio::test]
