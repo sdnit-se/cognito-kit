@@ -27,11 +27,12 @@ struct Inner {
 
 impl UserPool {
     /// A pool whose keys are fetched with a [`reqwest::Client`] that gives up
-    /// after ten seconds.
+    /// after ten seconds. Its TLS is rustls with ring, trusting the system's
+    /// root certificates; no process-wide rustls provider is installed.
     ///
     /// # Panics
     ///
-    /// If reqwest's TLS backend can't be initialised, as `reqwest::Client::new` does.
+    /// If the system has no root certificates to load, as `reqwest::Client::new` does.
     #[cfg(feature = "reqwest")]
     pub fn new(id: PoolId) -> Self {
         Self::with_http_client(id, crate::http_client::default_client())
@@ -40,10 +41,6 @@ impl UserPool {
     /// A pool whose keys are fetched, and whose token endpoint is called, with
     /// your own HTTP client.
     pub fn with_http_client(id: PoolId, http: impl HttpClient) -> Self {
-        // With exactly one of jsonwebtoken's crypto features on, it picks a
-        // provider by itself. Feature unification can turn on both, and then
-        // every check would panic, so choose one unless the program did.
-        let _ = jsonwebtoken::crypto::rust_crypto::DEFAULT_PROVIDER.install_default();
         let issuer = format!("https://cognito-idp.{}.amazonaws.com/{id}", id.region());
         let http = Http::new(http);
         let keys = KeyCache::new(

@@ -1,0 +1,6 @@
+# `mise run deny` checks this. The graph is what a dependent builds: every
+# feature on, and no dev-dependencies, since the crates that sign the tests'
+# tokens (jsonwebtoken, rsa) never reach a dependent's tree or audit.
+[graph]
+all-features = true
+exclude-dev = true
