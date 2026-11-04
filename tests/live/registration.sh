@@ -73,7 +73,9 @@ COGNITO_POOL_ID="$pool" COGNITO_LOGIN_DOMAIN="https://$domain.auth.${AWS_REGION}
 server=$!
 for _ in $(seq 50); do curl -s -o /dev/null "$base/.well-known/oauth-authorization-server" && break; sleep 0.2; done
 
-BASE="$base" USER_FILE="$work/user.json" bun tests/live/registration.ts
+# A failed flow or cleanup fails the run, after the checks below.
+status=0
+BASE="$base" USER_FILE="$work/user.json" bun tests/live/registration.ts || status=$?
 
 echo "app clients after the run:"
 aws cognito-idp list-user-pool-clients --user-pool-id "$pool" --max-results 60 \
@@ -86,7 +88,9 @@ for client in $(aws cognito-idp list-user-pool-clients --user-pool-id "$pool" --
     --query '{style_copied:ManagedLoginBranding.UseCognitoProvidedValues==`false`}' --output json
 done
 echo "registration items: $(aws dynamodb scan --table-name "$name" --select COUNT --query Count)"
-echo "cleanup: $(curl -s -X POST "$base/cleanup")"
+cleaned=$(curl -sS --fail-with-body -X POST "$base/cleanup") || status=1
+echo "cleanup: $cleaned"
 echo "app clients after cleanup: $(aws cognito-idp list-user-pool-clients --user-pool-id "$pool" --max-results 60 --query 'UserPoolClients[].ClientName' --output text)"
 echo "registration items after cleanup: $(aws dynamodb scan --table-name "$name" --select COUNT --query Count)"
 echo "server log:"; tail -5 "$work/server.log"
+exit "$status"

@@ -7,7 +7,7 @@
 //   BASE=http://localhost:3000 USER_FILE=<json with email, password> \
 //   PLAYWRIGHT=<path to playwright's index.mjs> [CODEX=codex] bun tests/live/registration.ts
 import { createHash, randomBytes } from 'node:crypto';
-import { mkdtempSync, readFileSync, writeFileSync, readdirSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -183,38 +183,45 @@ try {
     const child = Bun.spawn([codex, 'mcp', 'login', 'portal', '--no-browser', '--oauth-client-registration', strategy], {
       env: { ...process.env, CODEX_HOME: home }, stdin: 'pipe', stdout: 'pipe', stderr: 'pipe',
     });
-    let printed = '';
-    const decoder = new TextDecoder();
-    const authorize = await new Promise<string>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error(`codex printed no URL: ${printed.slice(0, 300)}`)), 30_000);
-      for (const stream of [child.stdout, child.stderr]) {
-        (async () => {
-          for await (const chunk of stream) {
-            printed += decoder.decode(chunk);
-            const found = /(http\S+\/oauth2\/authorize\S+)/.exec(printed);
-            if (found) { clearTimeout(timer); resolve(found[1]); }
-          }
-        })();
-      }
-    });
-    const sent = new URL(authorize);
-    const callback = await browse(authorize);
-    // In --no-browser mode Codex may take the callback URL on stdin too.
+    // The home holds Codex's tokens, and a child left running would keep
+    // this script from exiting.
     try {
-      child.stdin.write(`${callback.toString()}\n`);
-      child.stdin.end();
-    } catch {}
-    const exit = await Promise.race([child.exited, new Promise((r) => setTimeout(() => r('timeout'), 30_000))]);
-    const stored = readdirSync(home).filter((f) => f.includes('credential'));
-    const credentials = stored.length ? readFileSync(join(home, stored[0]), 'utf8') : '';
-    const access = /"access_token"\s*:\s*"([^"]+)"/.exec(credentials)?.[1];
-    return {
-      exit, clientIdIsUrl: sent.searchParams.get('client_id')?.startsWith('https://'),
-      redirect: sent.searchParams.get('redirect_uri')?.replace(/:\d+\//, ':<port>/'),
-      resource: sent.searchParams.get('resource'), stored: stored.length > 0,
-      access: access ? { aud: claimsOf(access).aud, scope: claimsOf(access).scope } : null,
-      mcp: access ? (await mcp(access)).status : null,
-    };
+      let printed = '';
+      const decoder = new TextDecoder();
+      const authorize = await new Promise<string>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`codex printed no URL: ${printed.slice(0, 300)}`)), 30_000);
+        for (const stream of [child.stdout, child.stderr]) {
+          (async () => {
+            for await (const chunk of stream) {
+              printed += decoder.decode(chunk);
+              const found = /(http\S+\/oauth2\/authorize\S+)/.exec(printed);
+              if (found) { clearTimeout(timer); resolve(found[1]); }
+            }
+          })();
+        }
+      });
+      const sent = new URL(authorize);
+      const callback = await browse(authorize);
+      // In --no-browser mode Codex may take the callback URL on stdin too.
+      try {
+        child.stdin.write(`${callback.toString()}\n`);
+        child.stdin.end();
+      } catch {}
+      const exit = await Promise.race([child.exited, new Promise((r) => setTimeout(() => r('timeout'), 30_000))]);
+      const stored = readdirSync(home).filter((f) => f.includes('credential'));
+      const credentials = stored.length ? readFileSync(join(home, stored[0]), 'utf8') : '';
+      const access = /"access_token"\s*:\s*"([^"]+)"/.exec(credentials)?.[1];
+      return {
+        exit, clientIdIsUrl: sent.searchParams.get('client_id')?.startsWith('https://'),
+        redirect: sent.searchParams.get('redirect_uri')?.replace(/:\d+\//, ':<port>/'),
+        resource: sent.searchParams.get('resource'), stored: stored.length > 0,
+        access: access ? { aud: claimsOf(access).aud, scope: claimsOf(access).scope } : null,
+        mcp: access ? (await mcp(access)).status : null,
+      };
+    } finally {
+      child.kill();
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 } catch (e) {
   report.failure = (e as Error).message;
@@ -222,3 +229,4 @@ try {
   await browser.close();
 }
 console.log(JSON.stringify(report, null, 2));
+if (JSON.stringify(report).includes('"failure"')) process.exitCode = 1;

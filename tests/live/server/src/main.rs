@@ -11,6 +11,7 @@ use std::time::Duration;
 use aws_config::BehaviorVersion;
 use aws_smithy_http_client::tls::{Provider, rustls_provider::CryptoMode};
 use axum::extract::State;
+use axum::http::StatusCode;
 use axum::routing::{any, post};
 use axum::{Json, Router};
 use cognito_kit::registration::{CognitoApi, DynamoStore, Registrar};
@@ -34,10 +35,16 @@ async fn mcp(claims: AccessClaims) -> Json<Value> {
     Json(json!({ "jsonrpc": "2.0", "id": 1, "result": { "sub": claims.sub, "client_id": claims.client_id } }))
 }
 
-async fn cleanup(State(app): State<App>) -> Json<Value> {
+async fn cleanup(State(app): State<App>) -> (StatusCode, Json<Value>) {
     match app.registrar.cleanup().await {
-        Ok(report) => Json(json!({ "unused": report.unused, "idle": report.idle, "orphans": report.orphans })),
-        Err(error) => Json(json!({ "error": error.to_string() })),
+        Ok(report) => (
+            StatusCode::OK,
+            Json(json!({ "unused": report.unused, "idle": report.idle, "orphans": report.orphans })),
+        ),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": error.to_string() })),
+        ),
     }
 }
 
