@@ -518,7 +518,13 @@ mod registration {
         }
 
         fn remove<'a>(&'a self, registration: &'a Registration) -> BoxFuture<'a, Result<(), BoxError>> {
-            self.0.lock().unwrap().remove(&registration.client_id);
+            let mut all = self.0.lock().unwrap();
+            if all
+                .get(&registration.client_id)
+                .is_some_and(|r| r.app_client == registration.app_client)
+            {
+                all.remove(&registration.client_id);
+            }
             ready(Ok(()))
         }
 

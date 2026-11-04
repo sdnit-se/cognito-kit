@@ -6,6 +6,8 @@ mod front;
 
 use std::time::Duration;
 
+use cognito_kit::registration::RegistrationStore;
+
 use front::{
     Authorization, DRAFTS, MCP, ORIGIN, call_mcp, get, json, location, open_server, post_form, post_json,
     server, sign_in,
@@ -105,6 +107,8 @@ async fn sends_codes_only_to_the_device_or_a_trusted_host() {
         "https://evil.example/callback",
         "http://evil.example/callback",
         "javascript:alert(1)",
+        "microsoft-edge:https://evil.example/callback",
+        "cursor://anysphere.cursor-mcp/oauth/callback",
         "https://claude.ai/callback#fragment",
     ] {
         let answer = post_json(&server.front, REGISTER, &registration(&[refused])).await;
@@ -114,7 +118,6 @@ async fn sends_codes_only_to_the_device_or_a_trusted_host() {
     assert!(server.cognito.app_clients().is_empty());
     for accepted in [
         "http://127.0.0.1:8765/callback",
-        "cursor://anysphere.cursor-mcp/oauth/callback",
         "https://claude.ai/api/mcp/auth_callback",
     ] {
         let answer = post_json(&server.front, REGISTER, &registration(&[accepted])).await;
@@ -382,4 +385,23 @@ async fn the_relay_sends_a_code_only_back_to_the_device() {
         location(&home).unwrap().as_str(),
         "http://127.0.0.1:8765/callback?code=stolen&state=x"
     );
+}
+
+#[tokio::test]
+async fn a_stale_removal_leaves_a_newer_registration() {
+    let server = open_server();
+    server
+        .documents
+        .serve(CLAUDE, &claude_document(&[CLAUDE_CALLBACK]));
+    let url = authorize_url(CLAUDE, CLAUDE_CALLBACK, true);
+    get(&server.front, &url).await;
+    let first = server.store.registrations().remove(0);
+    server.store.remove(&first).await.unwrap();
+    // The next sign-in registers the document again, with a new app client.
+    assert_eq!(get(&server.front, &url).await.status(), StatusCode::FOUND);
+    // A cleanup that listed the first registration removes it late.
+    server.store.remove(&first).await.unwrap();
+    let left = server.store.registrations();
+    assert_eq!(left.len(), 1);
+    assert_ne!(left[0].app_client, first.app_client);
 }

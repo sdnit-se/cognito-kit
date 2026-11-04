@@ -238,8 +238,9 @@ How it works:
   endpoint is public: anyone who learns an app client's id can send a
   signed-in user through it. So an app client is only ever created with
   redirect URIs that keep the code on the user's device (http on a loopback
-  host, or an app's own scheme), or that point at an https host you list
-  with `client_hosts`. With a list, documents are fetched only from those
+  host), or that point at an https host you list with `client_hosts`. Other
+  schemes are refused: one can hand its URL to a browser and send the code
+  off the device. With a list, documents are fetched only from those
   hosts too. Every registered client is public and must use PKCE with S256.
 
 **What happens near the limit.** Cognito allows 1,000 app clients per pool

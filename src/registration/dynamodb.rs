@@ -56,7 +56,10 @@ impl DynamoStore {
         let Some(pointer) = self.item(format!("app#{app_client}")).await? else {
             return Ok(None);
         };
-        self.get(string(&pointer, "client_id")?).await
+        // A pointer left by an interrupted removal names a client id that
+        // may since have been registered with another app client.
+        let found = self.get(string(&pointer, "client_id")?).await?;
+        Ok(found.filter(|r| r.app_client == *app_client))
     }
 
     async fn insert(&self, registration: Registration) -> Result<Registration, BoxError> {
@@ -134,20 +137,43 @@ impl DynamoStore {
     }
 
     async fn remove(&self, registration: &Registration) -> Result<(), BoxError> {
-        let delete = |pk: String| -> Result<TransactWriteItem, BoxError> {
-            let delete = Delete::builder()
-                .table_name(&self.table)
-                .key("pk", AttributeValue::S(pk))
-                .build()?;
-            Ok(TransactWriteItem::builder().delete(delete).build())
-        };
-        self.client
+        let app = AttributeValue::S(registration.app_client.to_string());
+        let client = Delete::builder()
+            .table_name(&self.table)
+            .key(
+                "pk",
+                AttributeValue::S(format!("client#{}", registration.client_id)),
+            )
+            .condition_expression("attribute_not_exists(pk) OR app_client = :app")
+            .expression_attribute_values(":app", app)
+            .build()?;
+        let pointer_key = AttributeValue::S(format!("app#{}", registration.app_client));
+        let pointer = Delete::builder()
+            .table_name(&self.table)
+            .key("pk", pointer_key.clone())
+            .build()?;
+        let removed = self
+            .client
             .transact_write_items()
-            .transact_items(delete(format!("client#{}", registration.client_id))?)
-            .transact_items(delete(format!("app#{}", registration.app_client))?)
+            .transact_items(TransactWriteItem::builder().delete(client).build())
+            .transact_items(TransactWriteItem::builder().delete(pointer).build())
             .send()
-            .await?;
-        Ok(())
+            .await;
+        match removed {
+            Ok(_) => Ok(()),
+            // The client id now belongs to another app client: keep its
+            // registration and drop only this one's pointer.
+            Err(error) if taken(error.as_service_error()) => {
+                self.client
+                    .delete_item()
+                    .table_name(&self.table)
+                    .key("pk", pointer_key)
+                    .send()
+                    .await?;
+                Ok(())
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     async fn list(&self) -> Result<Vec<Registration>, BoxError> {

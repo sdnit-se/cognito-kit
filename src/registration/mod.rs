@@ -5,8 +5,8 @@
 //! Cognito has no consent step, and its authorize endpoint is public: anyone
 //! who learns an app client's id can send a signed-in user through it.
 //! So an app client is only ever created with redirect URIs that keep the
-//! code on the user's device (http on a loopback host, or an app's own
-//! scheme), or that point at an https host you list with
+//! code on the user's device (http on a loopback host), or that point at an
+//! https host you list with
 //! [`client_hosts`](RegistrarBuilder::client_hosts).
 //!
 //! Native clients listen on a loopback port the system picks, and Cognito
@@ -116,7 +116,9 @@ pub trait RegistrationStore: Send + Sync + 'static {
     fn update<'a>(&'a self, registration: &'a Registration) -> BoxFuture<'a, Result<(), BoxError>>;
     /// Sets `last_used`.
     fn touch<'a>(&'a self, client_id: &'a str, at: u64) -> BoxFuture<'a, Result<(), BoxError>>;
-    /// Removes a registration. One that is already gone counts as removed.
+    /// Removes a registration, unless its `client_id` has since been
+    /// registered again with another app client. One that is already gone
+    /// counts as removed.
     fn remove<'a>(&'a self, registration: &'a Registration) -> BoxFuture<'a, Result<(), BoxError>>;
     /// Every registration.
     fn list(&self) -> BoxFuture<'_, Result<Vec<Registration>, BoxError>>;
@@ -302,9 +304,9 @@ impl RegistrarBuilder {
     /// only from these hosts, and https redirect URIs only on them.
     ///
     /// Without a list, documents are accepted from any host, and every
-    /// client must keep its codes on the user's device: http on a loopback
-    /// host, or an app's own scheme. That serves command-line and desktop
-    /// assistants, but not web ones such as Claude or ChatGPT.
+    /// client must keep its codes on the user's device, with http on a
+    /// loopback host. That serves command-line and desktop assistants, but
+    /// not web ones such as Claude or ChatGPT.
     pub fn client_hosts(mut self, hosts: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.client_hosts = Some(hosts.into_iter().map(|h| h.into().to_ascii_lowercase()).collect());
         self
@@ -313,7 +315,10 @@ impl RegistrarBuilder {
     /// The most registrations to hold. Defaults to 500, half the pool's
     /// default quota of 1,000 app clients, so that clients you manage
     /// yourself still fit. At the limit, new clients are refused with 503
-    /// until [`cleanup`](Registrar::cleanup) frees room.
+    /// until [`cleanup`](Registrar::cleanup) frees room. Registrations
+    /// already on their way when the limit is reached still complete, so
+    /// the count can pass it by the few that Cognito's rate of five app
+    /// clients a second lets through at once.
     pub fn max_registrations(mut self, max: usize) -> Self {
         self.max_registrations = max;
         self

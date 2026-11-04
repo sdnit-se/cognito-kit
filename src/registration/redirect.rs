@@ -3,26 +3,16 @@ use url::Url;
 /// Cognito refuses longer callback URLs.
 const MAX_LEN: usize = 1024;
 
-/// Schemes that would run code or read local files instead of returning
-/// to an app.
-const UNSAFE_SCHEMES: &[&str] = &[
-    "javascript",
-    "data",
-    "vbscript",
-    "file",
-    "blob",
-    "about",
-    "filesystem",
-];
-
 pub(crate) fn is_loopback_host(url: &Url) -> bool {
     matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))
 }
 
-/// Checks a redirect URI a client registers: https, http on a loopback
-/// host, or an app's own scheme; absolute, without credentials or a
-/// fragment, and written as URL parsing writes it, so that the string a
-/// client sends later can be compared without normalizing.
+/// Checks a redirect URI a client registers: https, or http on a loopback
+/// host; absolute, without credentials or a fragment, and written as URL
+/// parsing writes it, so that the string a client sends later can be
+/// compared without normalizing. Other schemes are refused: one can hand
+/// its URL to a browser, as `microsoft-edge:https://...` does, and send the
+/// code off the device.
 pub(crate) fn check(uri: &str) -> Result<Url, String> {
     let url = Url::parse(uri).map_err(|_| format!("{uri:?} is not an absolute URL"))?;
     let refuse = |why: &str| Err(format!("{uri}: {why}"));
@@ -39,8 +29,7 @@ pub(crate) fn check(uri: &str) -> Result<Url, String> {
         "https" if url.host().is_some() => Ok(url),
         "http" if is_loopback_host(&url) => Ok(url),
         "http" | "https" => refuse("http is allowed only on localhost, 127.0.0.1 and [::1]"),
-        scheme if UNSAFE_SCHEMES.contains(&scheme) => refuse("not a scheme an app can receive a code on"),
-        _ => Ok(url),
+        _ => refuse("only https and loopback http redirect URIs are accepted"),
     }
 }
 
