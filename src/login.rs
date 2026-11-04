@@ -5,9 +5,10 @@ use std::time::Duration;
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use http::{HeaderValue, header};
+use ring::digest::{SHA256, digest};
+use ring::rand::{SecureRandom, SystemRandom};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use url::Url;
 use url::form_urlencoded;
@@ -259,7 +260,9 @@ struct TokenResponse {
 
 fn random() -> String {
     let mut bytes = [0u8; 32];
-    getrandom::fill(&mut bytes).expect("the operating system's random source works");
+    SystemRandom::new()
+        .fill(&mut bytes)
+        .expect("the operating system's random source works");
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
@@ -276,7 +279,7 @@ impl ManagedLogin {
             nonce: random(),
             verifier: random(),
         };
-        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(pending.verifier.as_bytes()));
+        let challenge = URL_SAFE_NO_PAD.encode(digest(&SHA256, pending.verifier.as_bytes()));
         let mut url = self.domain.endpoint("/oauth2/authorize");
         {
             let mut query = url.query_pairs_mut();
