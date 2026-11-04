@@ -31,6 +31,9 @@ pub enum ConfigError {
     /// An OAuth front was given a verifier without a resource.
     #[error("the OAuth front needs a verifier built with `resource`")]
     NoResource,
+    /// A registrar's settings can't work, and why.
+    #[error("registrar: {0}")]
+    Registration(&'static str),
 }
 
 fn url_error(url: &str, reason: &'static str) -> ConfigError {

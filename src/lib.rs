@@ -2,7 +2,7 @@
 //!
 //! Unofficial. Not affiliated with or endorsed by AWS.
 //!
-//! `cognito-kit` covers three jobs:
+//! `cognito-kit` covers four jobs:
 //!
 //! - **Token checks** for any service that Cognito protects. It verifies
 //!   access tokens and ID tokens against the user pool's published keys and
@@ -15,6 +15,13 @@
 //!   RFC 9728 protected resource metadata, RFC 8414 authorization server
 //!   metadata that advertises PKCE with `S256`, and `WWW-Authenticate`
 //!   challenges.
+//! - **Clients that register themselves** (feature `registration`): an
+//!   assistant's Client ID Metadata Document URL as its client id, or
+//!   Dynamic Client Registration, each mapped to an app client the
+//!   [`registration::Registrar`] creates. Assistants then connect from the
+//!   MCP server's URL alone.
+//!
+//! The `test-kit` feature adds [`test_kit::FakeCognito`] for your own tests.
 //!
 //! The core uses only [`http`] types and works with any web framework or
 //! none. The `axum` and `tower` features add adapters. The crate is
@@ -83,6 +90,24 @@
 //! AccessClaims<C>: axum::extract::FromRequestParts<S> where AccessTokenVerifier: FromRef<S>   (feature `axum`)
 //! OAuthFront::router<S>(&self) -> axum::Router<S>                                             (feature `axum`)
 //! RequireBearerLayer::<C>::new(AccessTokenVerifier)                                          (feature `tower`)
+//!
+//! // Clients that register themselves (feature `registration`)
+//! OAuthFront::handle(&self, &http::Request<impl AsRef<[u8]>>) -> Option<http::Response<String>>
+//! AccessTokenVerifierBuilder::registrar(self, Registrar)       accepts the registrar's app clients
+//! Registrar::builder(impl AppClients, impl RegistrationStore) -> RegistrarBuilder
+//!     .metadata_documents() / .fetcher(impl FetchDocument)    a URL as client_id
+//!     .dynamic_registration()                                 RFC 7591 at /oauth2/register
+//!     .client_hosts(..)                                       https hosts trusted with codes
+//!     .max_registrations(usize) .unused_after(Duration) .idle_after(Duration) .name_prefix(..)
+//!     .build() -> Result<Registrar, ConfigError>
+//! Registrar::cleanup(&self) -> Result<Cleanup, RegistrationError>
+//! CognitoApi::new(aws_sdk_cognitoidentityprovider::Client, PoolId, template: ClientId)
+//! DynamoStore::new(aws_sdk_dynamodb::Client, table)                              (feature `dynamodb`)
+//! GuardedFetcher::new()                                        https, 5 KiB, 5 s, public addresses only
+//!
+//! // Tests (feature `test-kit`)
+//! FakeCognito::new() .pool() .login_domain() .add_client(..) .access_token(..) .sign(..) .sign_in(..)
+//! MemoryStore::new()                                                        (with `registration`)
 //! ```
 //!
 //! Every token check runs before your code sees a claim, so a value of
@@ -167,6 +192,12 @@ mod verify;
 
 #[cfg(feature = "axum")]
 mod axum;
+#[cfg(feature = "registration")]
+#[cfg_attr(docsrs, doc(cfg(feature = "registration")))]
+pub mod registration;
+#[cfg(feature = "test-kit")]
+#[cfg_attr(docsrs, doc(cfg(feature = "test-kit")))]
+pub mod test_kit;
 #[cfg(feature = "tower")]
 mod tower;
 

@@ -14,6 +14,8 @@ use crate::claims::{AccessClaims, IdClaims};
 use crate::config::{ClientId, ConfigError, Scope, check_url};
 use crate::http_client::BoxError;
 use crate::pool::UserPool;
+#[cfg(feature = "registration")]
+use crate::registration::Registrar;
 
 const DEFAULT_LEEWAY: Duration = Duration::from_secs(60);
 
@@ -58,6 +60,10 @@ pub enum Rejection {
     /// The pool's keys could not be fetched. Answered with 503.
     #[error("the pool's signing keys could not be fetched")]
     KeysUnavailable(#[source] Arc<BoxError>),
+    /// The registrar's store could not be read to check the token's app
+    /// client. Answered with 503.
+    #[error("the registered clients could not be read")]
+    RegistryUnavailable(#[source] Arc<BoxError>),
 }
 
 impl Rejection {
@@ -66,7 +72,7 @@ impl Rejection {
     pub fn status(&self) -> StatusCode {
         match self {
             Self::Scope(_) => StatusCode::FORBIDDEN,
-            Self::KeysUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            Self::KeysUnavailable(_) | Self::RegistryUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::UNAUTHORIZED,
         }
     }
@@ -74,7 +80,7 @@ impl Rejection {
     /// The RFC 6750 error code, if the response gets one.
     fn code(&self) -> Option<&'static str> {
         match self {
-            Self::Missing | Self::KeysUnavailable(_) => None,
+            Self::Missing | Self::KeysUnavailable(_) | Self::RegistryUnavailable(_) => None,
             Self::Scope(_) => Some("insufficient_scope"),
             _ => Some("invalid_token"),
         }
@@ -98,7 +104,7 @@ impl Challenge {
     /// The response to send.
     pub fn response(self) -> http::Response<String> {
         let fallback = match self.rejection {
-            Rejection::KeysUnavailable(_) => "temporarily_unavailable",
+            Rejection::KeysUnavailable(_) | Rejection::RegistryUnavailable(_) => "temporarily_unavailable",
             _ => "unauthorized",
         };
         let body = serde_json::json!({
@@ -141,14 +147,14 @@ fn has_audience(aud: Option<&Value>, expected: &str) -> bool {
 }
 
 /// Verifies a token's signature, issuer, expiry and kind, and its audience
-/// when `audience` is set, then reads its claims.
-async fn decode<T: DeserializeOwned>(
+/// when `audience` is set, and returns its claims.
+async fn decode(
     pool: &UserPool,
     token: &str,
     token_use: &str,
     audience: Option<&str>,
     leeway: Duration,
-) -> Result<T, Rejection> {
+) -> Result<Map<String, Value>, Rejection> {
     // A fourth segment leaves a '.' in the payload, which base64url refuses.
     let (signed, signature) = token.rsplit_once('.').ok_or(Rejection::Malformed)?;
     let (header, payload) = signed.split_once('.').ok_or(Rejection::Malformed)?;
@@ -190,6 +196,10 @@ async fn decode<T: DeserializeOwned>(
     if claims.get("token_use").and_then(Value::as_str) != Some(token_use) {
         return Err(Rejection::TokenUse);
     }
+    Ok(claims)
+}
+
+fn typed<T: DeserializeOwned>(claims: Map<String, Value>) -> Result<T, Rejection> {
     serde_json::from_value(Value::Object(claims)).map_err(|_| Rejection::Malformed)
 }
 
@@ -203,6 +213,8 @@ pub struct AccessTokenVerifier {
     scopes: Arc<[Scope]>,
     audience: Audience,
     leeway: Duration,
+    #[cfg(feature = "registration")]
+    registrar: Option<Registrar>,
 }
 
 #[derive(Clone)]
@@ -229,6 +241,8 @@ pub struct AccessTokenVerifierBuilder {
     scopes: Vec<Scope>,
     audience: Audience,
     leeway: Duration,
+    #[cfg(feature = "registration")]
+    registrar: Option<Registrar>,
 }
 
 impl AccessTokenVerifierBuilder {
@@ -239,10 +253,24 @@ impl AccessTokenVerifierBuilder {
             scopes: Vec::new(),
             audience: Audience::Unchecked,
             leeway: DEFAULT_LEEWAY,
+            #[cfg(feature = "registration")]
+            registrar: None,
         }
     }
 
-    /// Accepts tokens issued to this app client. At least one is required.
+    /// Accepts tokens issued to the app clients of the registrar's
+    /// registrations too, and lets an [`OAuthFront`](crate::OAuthFront)
+    /// built from this verifier register clients. With a registrar, no
+    /// other app client is required.
+    #[cfg(feature = "registration")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "registration")))]
+    pub fn registrar(mut self, registrar: Registrar) -> Self {
+        self.registrar = Some(registrar);
+        self
+    }
+
+    /// Accepts tokens issued to this app client. At least one is required,
+    /// unless the verifier has a registrar.
     pub fn client(mut self, client: ClientId) -> Self {
         self.clients.insert(client);
         self
@@ -286,10 +314,14 @@ impl AccessTokenVerifierBuilder {
         self
     }
 
-    /// Checks the settings: at least one client, and an https audience (or
-    /// http on localhost).
+    /// Checks the settings: at least one client or a registrar, and an
+    /// https audience (or http on localhost).
     pub fn build(self) -> Result<AccessTokenVerifier, ConfigError> {
-        if self.clients.is_empty() {
+        #[cfg(feature = "registration")]
+        let registered = self.registrar.is_some();
+        #[cfg(not(feature = "registration"))]
+        let registered = false;
+        if self.clients.is_empty() && !registered {
             return Err(ConfigError::NoClients);
         }
         if let Some(audience) = self.audience.url() {
@@ -301,6 +333,8 @@ impl AccessTokenVerifierBuilder {
             scopes: self.scopes.into(),
             audience: self.audience,
             leeway: self.leeway,
+            #[cfg(feature = "registration")]
+            registrar: self.registrar,
         })
     }
 }
@@ -310,11 +344,17 @@ impl AccessTokenVerifier {
     /// issuer, expiry, kind, app client, audience and scopes.
     pub async fn verify<C: DeserializeOwned>(&self, token: &str) -> Result<AccessClaims<C>, Rejection> {
         let audience = self.audience.url().map(canonical);
-        let claims: AccessClaims<C> =
-            decode(&self.pool, token, "access", audience.as_deref(), self.leeway).await?;
-        if !self.clients.contains(&claims.client_id) {
+        let claims = decode(&self.pool, token, "access", audience.as_deref(), self.leeway).await?;
+        let client = claims
+            .get("client_id")
+            .and_then(Value::as_str)
+            .and_then(|c| c.parse::<ClientId>().ok())
+            .ok_or(Rejection::Malformed)?;
+        // Checked before the typed claims exist, so that `C` needn't be `Send`.
+        if !self.accepts(&client).await? {
             return Err(Rejection::Client);
         }
+        let claims: AccessClaims<C> = typed(claims)?;
         if let Some(missing) = self.scopes.iter().find(|s| !claims.scopes.contains(s)) {
             return Err(Rejection::Scope(missing.clone()));
         }
@@ -356,13 +396,40 @@ impl AccessTokenVerifier {
         } else {
             format!("Bearer {}", params.join(", "))
         };
-        let www_authenticate = HeaderValue::try_from(value)
-            .ok()
-            .filter(|_| !matches!(rejection, Rejection::KeysUnavailable(_)));
+        let www_authenticate = HeaderValue::try_from(value).ok().filter(|_| {
+            !matches!(
+                rejection,
+                Rejection::KeysUnavailable(_) | Rejection::RegistryUnavailable(_)
+            )
+        });
         Challenge {
             rejection,
             www_authenticate,
         }
+    }
+
+    async fn accepts(&self, client: &ClientId) -> Result<bool, Rejection> {
+        if self.clients.contains(client) {
+            return Ok(true);
+        }
+        #[cfg(feature = "registration")]
+        if let Some(registrar) = &self.registrar {
+            return registrar
+                .knows(client)
+                .await
+                .map_err(|e| Rejection::RegistryUnavailable(Arc::new(e)));
+        }
+        Ok(false)
+    }
+
+    #[cfg(feature = "registration")]
+    pub(crate) fn registrar(&self) -> Option<&Registrar> {
+        self.registrar.as_ref()
+    }
+
+    #[cfg(feature = "registration")]
+    pub(crate) fn pool(&self) -> &UserPool {
+        &self.pool
     }
 
     pub(crate) fn resource(&self) -> Option<&Url> {
@@ -437,6 +504,6 @@ impl IdTokenVerifier {
     /// Verifies an ID token: its signature, issuer, expiry, kind, and that
     /// its `aud` is this verifier's app client.
     pub async fn verify<C: DeserializeOwned>(&self, token: &str) -> Result<IdClaims<C>, Rejection> {
-        decode(&self.pool, token, "id", Some(self.client.as_str()), self.leeway).await
+        typed(decode(&self.pool, token, "id", Some(self.client.as_str()), self.leeway).await?)
     }
 }

@@ -1,7 +1,7 @@
 use axum::extract::{FromRef, FromRequestParts};
 use axum::response::{IntoResponse, Response};
+use http::StatusCode;
 use http::request::Parts;
-use http::{Method, StatusCode};
 use serde::de::DeserializeOwned;
 
 use crate::{AccessClaims, AccessTokenVerifier, Challenge, OAuthFront};
@@ -31,20 +31,28 @@ where
 }
 
 impl OAuthFront {
-    /// Routes for the metadata documents, to merge into your router.
+    /// Routes for the front's paths, to merge into your router: the
+    /// metadata documents, and with a registrar its own endpoints.
     #[cfg_attr(docsrs, doc(cfg(feature = "axum")))]
     pub fn router<S: Clone + Send + Sync + 'static>(&self) -> axum::Router<S> {
         self.paths().fold(axum::Router::new(), |router, path| {
             let front = self.clone();
-            let owned = path.to_owned();
-            let respond = move || {
-                let response = front.respond(&Method::GET, &owned);
-                std::future::ready(response.map_or_else(
-                    || StatusCode::NOT_FOUND.into_response(),
-                    IntoResponse::into_response,
-                ))
+            let handle = move |request: axum::extract::Request| {
+                let front = front.clone();
+                async move {
+                    let (parts, body) = request.into_parts();
+                    // OAuth requests are a few hundred bytes.
+                    let Ok(body) = axum::body::to_bytes(body, 64 * 1024).await else {
+                        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+                    };
+                    let request = http::Request::from_parts(parts, body);
+                    front.handle(&request).await.map_or_else(
+                        || StatusCode::METHOD_NOT_ALLOWED.into_response(),
+                        IntoResponse::into_response,
+                    )
+                }
             };
-            router.route(path, axum::routing::get(respond))
+            router.route(path, axum::routing::any(handle))
         })
     }
 }

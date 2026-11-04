@@ -78,21 +78,26 @@ impl HttpClient for reqwest::Client {
     }
 }
 
+/// rustls with ring, trusting the system's root certificates.
 #[cfg(feature = "reqwest")]
-pub(crate) fn default_client() -> reqwest::Client {
+pub(crate) fn tls_config() -> rustls::ClientConfig {
     use rustls_platform_verifier::BuilderVerifierExt;
 
-    // Given to this client only: installing ring as the process-wide provider
-    // would make that choice for the whole program.
+    // Given to this crate's clients only: installing ring as the
+    // process-wide provider would make that choice for the whole program.
     let ring = Arc::new(rustls::crypto::ring::default_provider());
-    let tls = rustls::ClientConfig::builder_with_provider(ring)
+    rustls::ClientConfig::builder_with_provider(ring)
         .with_safe_default_protocol_versions()
         .and_then(BuilderVerifierExt::with_platform_verifier)
         .expect("the system's root certificates load")
-        .with_no_client_auth();
+        .with_no_client_auth()
+}
+
+#[cfg(feature = "reqwest")]
+pub(crate) fn default_client() -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
-        .tls_backend_preconfigured(tls)
+        .tls_backend_preconfigured(tls_config())
         .build()
         .expect("reqwest takes the rustls configuration")
 }
