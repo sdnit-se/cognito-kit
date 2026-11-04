@@ -4,7 +4,7 @@ Unofficial. Not affiliated with or endorsed by AWS.
 
 A Rust toolkit for Amazon Cognito. It checks the tokens a user pool issues,
 signs people in on the web through managed login, and puts an MCP server
-behind Cognito so that AI assistants can sign in to it.
+behind Cognito so that AI assistants can sign in to it from its URL alone.
 
 - **Token checks** for any service that Cognito protects. Keys are fetched
   and cached, and refetched for an unknown key at a limited rate. Issuer,
@@ -16,6 +16,12 @@ behind Cognito so that AI assistants can sign in to it.
   what MCP clients need and Cognito lacks: the protected resource metadata
   (RFC 9728), authorization server metadata (RFC 8414) that lists `S256`,
   and `WWW-Authenticate` challenges.
+- **Clients that register themselves.** An assistant sends the URL of its
+  Client ID Metadata Document as its client id, or registers through
+  Dynamic Client Registration (RFC 7591), and gets an app client of its own
+  in the pool. Nobody types a client id.
+- **A test kit**: a fake Cognito with a key set, signed tokens and managed
+  login's endpoints, for your own tests.
 - **An OpenTofu module** for the pool, Google sign-in, a resource server,
   app clients with refresh-token rotation, and branded managed login.
 
@@ -34,11 +40,16 @@ cargo add cognito-kit
 | `reqwest` | yes     | `UserPool::new`, with a reqwest client for fetching keys and calling the token endpoint: rustls with ring, trusting the system's root certificates |
 | `axum`    | no      | `AccessClaims` as an extractor, and `OAuthFront::router` |
 | `tower`   | no      | `RequireBearerLayer`, which admits only requests with a valid token |
+| `registration` | no | `Registrar`, for clients that register themselves, with `CognitoApi` over the AWS SDK. Turns on `reqwest` |
+| `dynamodb` | no     | `DynamoStore`, which keeps registrations in DynamoDB. Turns on `registration` |
+| `test-kit` | no     | `FakeCognito`, and with `registration`, `MemoryStore` |
 
 Without `reqwest`, implement `HttpClient` for the client you already use and
 build the pool with `UserPool::with_http_client`.
 
-The minimum supported Rust version is 1.88.
+The minimum supported Rust version is 1.88. `registration` and `dynamodb`
+need what the AWS SDK needs, Rust 1.94.1 for the versions this release was
+tested with.
 
 ## Check access tokens
 
@@ -160,6 +171,98 @@ How it fits together:
 [`examples/portal.rs`](examples/portal.rs) is a small portal on axum with
 web sign-in and an MCP endpoint.
 
+## Let assistants register themselves
+
+With a `Registrar` on the verifier, the front serves its own
+`/oauth2/authorize`, `/oauth2/token`, `/oauth2/revoke` and
+`/oauth2/callback`, and with Dynamic Client Registration `/oauth2/register`. Its metadata points at them and
+says `client_id_metadata_document_supported`. Claude, ChatGPT, Claude Code,
+Codex and Executor then connect from the MCP URL alone.
+
+```rust,ignore
+use cognito_kit::registration::{CognitoApi, DynamoStore, Registrar};
+
+let aws = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+let registrar = Registrar::builder(
+    CognitoApi::new(aws_sdk_cognitoidentityprovider::Client::new(&aws), pool_id.clone(), template_client),
+    DynamoStore::new(aws_sdk_dynamodb::Client::new(&aws), "portal-registrations"),
+)
+.metadata_documents()
+.dynamic_registration()
+.client_hosts(["claude.ai", "chatgpt.com", "executor.sh"])
+.build()?;
+
+let verifier = UserPool::new(pool_id)
+    .access_tokens()
+    .registrar(registrar.clone())
+    .resource("https://portal.example.com/mcp".parse()?)
+    .scope("https://portal.example.com/mcp/drafts".parse()?)
+    .build()?;
+let front = OAuthFront::new(verifier, "https://login.example.com".parse()?)?;
+
+// For each request: the front's documents and endpoints, then your MCP server.
+if let Some(response) = front.handle(&request).await {
+    return response;
+}
+```
+
+How it works:
+
+- **One app client per client.** A client's first authorization creates a
+  public app client like the template client you name: its scopes, identity
+  providers, token lifetimes and managed login style, with refresh-token
+  rotation. The front swaps the client's `client_id` for the app client's on
+  the way to managed login and the token endpoint; Cognito still issues
+  every token. The verifier accepts tokens from these app clients, and a
+  token from any other app client is refused.
+- **Client ID Metadata Documents.** A `client_id` that is an https URL is
+  fetched with `GuardedFetcher`: https only, at most 5 KiB within five
+  seconds, no redirects and no proxy. Every address the host resolves to
+  must be public, and the connection goes to exactly the addresses checked,
+  so DNS rebinding can't reach a private one. The document must name its
+  own URL and list the redirect URI. It is fetched again after five
+  minutes, and kept while its host is briefly down.
+- **Any port on loopback.** Claude Code, Codex and Executor list
+  `http://localhost/callback`-style URIs and listen on a port the system
+  picks (RFC 8252). Cognito matches callback URLs exactly, and managed login
+  took 140 seconds to accept a callback URL added to an existing app client
+  when we measured. So Cognito sends these clients' codes to the front's
+  `/oauth2/callback`, its only callback URL for them, and the front passes
+  each code on to the loopback URI its authorization started with. It never
+  passes one anywhere else.
+- **Dynamic Client Registration** is for clients without a document. The
+  client id it hands out is the app client's id.
+- **App clients you create yourself** keep working through the front's
+  endpoints, unchanged.
+- **Where codes may go.** Cognito has no consent step, and its authorize
+  endpoint is public: anyone who learns an app client's id can send a
+  signed-in user through it. So an app client is only ever created with
+  redirect URIs that keep the code on the user's device (http on a loopback
+  host), or that point at an https host you list with `client_hosts`. Other
+  schemes are refused: one can hand its URL to a browser and send the code
+  off the device. With a list, documents are fetched only from those
+  hosts too. Every registered client is public and must use PKCE with S256.
+
+**What happens near the limit.** Cognito allows 1,000 app clients per pool
+by default; AWS Support can raise it. The registrar stops at
+`max_registrations`, 500 by default, so the app clients you manage still
+fit. Past it, and when Cognito refuses at its own limit, new clients get a
+503 with `temporarily_unavailable`, while registered ones keep working.
+An OpenTofu apply that adds an app client also fails at Cognito's limit.
+
+**Cleanup.** Run `Registrar::cleanup` on a schedule, such as daily. It
+deletes registrations and their app clients that never completed a token
+request within a day, and those without one for longer than `idle_after`
+(31 days, longer than Cognito's default refresh-token lifetime). It also
+deletes app clients with the registrar's name prefix that it has no
+registration for, which a server can leave behind if it stops between
+creating one and storing it.
+
+**Rates.** Cognito allows five app-client changes per second per pool,
+shared with every other caller. Requests can cause at most ten a minute per
+process. Put a rate rule in front of `/oauth2/authorize` and
+`/oauth2/register` too, such as an AWS WAF rule.
+
 ## The OpenTofu module
 
 ```hcl
@@ -185,6 +288,11 @@ module "cognito" {
 }
 ```
 
+With `registration = { template_client = "claude" }` the module also
+creates a DynamoDB table for `DynamoStore`, and outputs
+`registration_policy_json`: an IAM policy for the server that allows the
+registrar's calls on this pool and table, and nothing else.
+
 Every app client uses the authorization code grant and rotates refresh
 tokens; the module refuses `ALLOW_REFRESH_TOKEN_AUTH`, which turns rotation
 off. Google's client secret is written once, as a placeholder unless you pass
@@ -197,8 +305,11 @@ assistants.
 
 Every tool and task runs through [mise](https://mise.jdx.dev): `mise run ci`
 runs what CI runs. `tests/live/flow.ts` drives the example against a real
-pool with Playwright; the tests in `tests/` use a fake Cognito and need no
-AWS account.
+pool with Playwright, and `tests/live/registration.sh` creates a throwaway
+pool and table, connects Claude Code's flows and the real Codex CLI to them
+by document and by registration, and deletes both. The tests in `tests/`
+use a fake Cognito and need no AWS account; `tests/assistants.rs` replays
+each assistant's OAuth flow against the front.
 
 ## Security
 

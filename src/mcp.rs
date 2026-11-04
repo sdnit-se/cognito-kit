@@ -22,20 +22,27 @@ pub struct ProtectedResourceMetadata {
 }
 
 /// RFC 8414 authorization server metadata. Its endpoints are managed
-/// login's own; only the document is ours, because Cognito's discovery
-/// document doesn't list `code_challenge_methods_supported`.
+/// login's own, or with a registrar the front's; the document is ours,
+/// because Cognito's discovery document doesn't list
+/// `code_challenge_methods_supported`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
 pub struct AuthorizationServerMetadata {
     /// The resource's origin. It must equal the URL the document is read from,
     /// minus the well-known path (RFC 8414 section 3.3).
     pub issuer: String,
-    /// Managed login's `/oauth2/authorize`.
+    /// `/oauth2/authorize`: managed login's, or with a registrar the front's.
     pub authorization_endpoint: String,
-    /// Managed login's `/oauth2/token`.
+    /// `/oauth2/token`, managed login's or the front's.
     pub token_endpoint: String,
-    /// Managed login's `/oauth2/revoke`.
+    /// `/oauth2/revoke`, managed login's or the front's.
     pub revocation_endpoint: String,
+    /// The front's `/oauth2/register`, with Dynamic Client Registration on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registration_endpoint: Option<String>,
+    /// `true` when the front accepts Client ID Metadata Documents.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_id_metadata_document_supported: Option<bool>,
     /// `code`.
     pub response_types_supported: Vec<String>,
     /// `query`.
@@ -53,8 +60,10 @@ pub struct AuthorizationServerMetadata {
 }
 
 /// What an MCP server needs in front of Cognito so that MCP clients can
-/// sign in with pre-registered public app clients: the two metadata
-/// documents, and the verifier whose challenges point at them.
+/// sign in: the two metadata documents, and the verifier whose challenges
+/// point at them. Clients use app clients you create, or with a
+/// [`Registrar`](crate::registration::Registrar) on the verifier, register
+/// themselves through the front's own endpoints.
 ///
 /// The authorization server's issuer is the resource's origin, so the
 /// documents and the MCP endpoint share a host. Cognito still authorizes,
@@ -65,6 +74,8 @@ pub struct OAuthFront {
     resource_metadata: ProtectedResourceMetadata,
     authorization_server_metadata: AuthorizationServerMetadata,
     resource_paths: Vec<String>,
+    #[cfg(feature = "registration")]
+    endpoints: Option<crate::registration::Endpoints>,
 }
 
 fn strings<'a>(items: impl IntoIterator<Item = &'a str>) -> Vec<String> {
@@ -73,12 +84,44 @@ fn strings<'a>(items: impl IntoIterator<Item = &'a str>) -> Vec<String> {
 
 impl OAuthFront {
     /// `verifier` must be built with
-    /// [`resource`](crate::AccessTokenVerifierBuilder::resource).
+    /// [`resource`](crate::AccessTokenVerifierBuilder::resource). When it
+    /// has a [`registrar`](crate::AccessTokenVerifierBuilder::registrar),
+    /// the front also serves `/oauth2/authorize`, `/oauth2/token`,
+    /// `/oauth2/revoke`, `/oauth2/callback` and, with Dynamic Client
+    /// Registration, `/oauth2/register`, and the metadata points at them;
+    /// serve them with [`handle`](Self::handle).
     pub fn new(verifier: AccessTokenVerifier, login: LoginDomain) -> Result<Self, ConfigError> {
         let resource = verifier.resource().ok_or(ConfigError::NoResource)?;
         let issuer = resource.origin().ascii_serialization();
         let scopes = strings(verifier.scopes().iter().map(Scope::as_str));
-        let endpoint = |path: &str| login.endpoint(path).to_string();
+        #[cfg(feature = "registration")]
+        let endpoints = verifier
+            .registrar()
+            .map(|registrar| crate::registration::Endpoints {
+                registrar: registrar.clone(),
+                login: login.clone(),
+                http: verifier.pool().http().clone(),
+                relay: format!("{issuer}/oauth2/callback"),
+            });
+        #[cfg(feature = "registration")]
+        let (registration_endpoint, documents) = match &endpoints {
+            Some(e) => (
+                e.registrar.dynamic().then(|| format!("{issuer}/oauth2/register")),
+                e.registrar.documents().then_some(true),
+            ),
+            None => (None, None),
+        };
+        #[cfg(not(feature = "registration"))]
+        let (registration_endpoint, documents) = (None, None);
+        let own = registration_endpoint.is_some() || documents.is_some();
+        let origin = issuer.clone();
+        let endpoint = |path: &str| {
+            if own {
+                format!("{origin}{path}")
+            } else {
+                login.endpoint(path).to_string()
+            }
+        };
         let resource_metadata = ProtectedResourceMetadata {
             resource: canonical(resource),
             authorization_servers: vec![issuer.clone()],
@@ -90,6 +133,8 @@ impl OAuthFront {
             authorization_endpoint: endpoint("/oauth2/authorize"),
             token_endpoint: endpoint("/oauth2/token"),
             revocation_endpoint: endpoint("/oauth2/revoke"),
+            registration_endpoint,
+            client_id_metadata_document_supported: documents,
             response_types_supported: strings(["code"]),
             response_modes_supported: strings(["query"]),
             grant_types_supported: strings(["authorization_code", "refresh_token"]),
@@ -110,6 +155,8 @@ impl OAuthFront {
             resource_metadata,
             authorization_server_metadata,
             resource_paths,
+            #[cfg(feature = "registration")]
+            endpoints,
         })
     }
 
@@ -130,8 +177,33 @@ impl OAuthFront {
         &self.authorization_server_metadata
     }
 
+    /// Answers a request to the front: the metadata documents, and with a
+    /// registrar the front's own endpoints. Returns `None` for every other
+    /// request, which is yours to answer.
+    pub async fn handle<B: AsRef<[u8]>>(&self, request: &http::Request<B>) -> Option<http::Response<String>> {
+        let path = request.uri().path();
+        if let Some(response) = self.respond(request.method(), path) {
+            return Some(response);
+        }
+        #[cfg(feature = "registration")]
+        if let Some(endpoints) = &self.endpoints {
+            let body = request.body().as_ref();
+            return endpoints
+                .handle(
+                    request.method(),
+                    path,
+                    request.uri().query(),
+                    request.headers(),
+                    body,
+                )
+                .await;
+        }
+        None
+    }
+
     /// Answers a request for one of the metadata documents, or returns
-    /// `None` for every other request.
+    /// `None` for every other request. With a registrar, use
+    /// [`handle`](Self::handle), which also serves the front's endpoints.
     pub fn respond(&self, method: &Method, path: &str) -> Option<http::Response<String>> {
         if method != Method::GET {
             return None;
@@ -152,12 +224,17 @@ impl OAuthFront {
         Some(response)
     }
 
-    /// The paths [`respond`](Self::respond) answers, for routers that
+    /// The paths [`handle`](Self::handle) answers, for routers that
     /// register routes one by one.
     pub fn paths(&self) -> impl Iterator<Item = &str> {
+        #[cfg(feature = "registration")]
+        let endpoints = self.endpoints.as_ref().map(|e| e.paths()).unwrap_or_default();
+        #[cfg(not(feature = "registration"))]
+        let endpoints: Vec<&str> = Vec::new();
         self.resource_paths
             .iter()
             .map(String::as_str)
             .chain([AUTHORIZATION_SERVER])
+            .chain(endpoints)
     }
 }

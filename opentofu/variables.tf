@@ -111,3 +111,17 @@ variable "branding" {
   })
   default = null
 }
+
+variable "registration" {
+  description = "A DynamoDB table for cognito-kit's Registrar, and the IAM policy its server needs. Clients that register themselves get app clients made like template_client, one of `clients`."
+  type = object({
+    template_client = string
+    table_name      = optional(string)
+  })
+  default = null
+
+  validation {
+    condition     = var.registration == null || contains(keys(var.clients), try(var.registration.template_client, ""))
+    error_message = "registration.template_client names one of the clients."
+  }
+}

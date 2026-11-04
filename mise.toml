@@ -31,6 +31,8 @@ run = [
   "cargo clippy --all-targets -- -D warnings",
   "cargo clippy --all-targets --no-default-features --features axum -- -D warnings",
   "cargo clippy --all-targets --no-default-features --features tower -- -D warnings",
+  "cargo clippy --all-targets --no-default-features --features test-kit -- -D warnings",
+  "cargo clippy --all-targets --no-default-features --features registration -- -D warnings",
   "cargo clippy --all-targets --all-features -- -D warnings",
 ]
 
@@ -42,6 +44,7 @@ run = [
   "cargo test",
   "cargo test --no-default-features --features axum --lib --tests",
   "cargo test --no-default-features --features tower --lib --tests",
+  "cargo test --no-default-features --features test-kit --lib --tests",
   "cargo test --all-features",
 ]
 
@@ -51,8 +54,11 @@ env = { RUSTDOCFLAGS = "-D warnings" }
 run = "cargo doc --no-deps --all-features"
 
 [tasks.msrv]
-description = "Check that the crate builds on its minimum supported Rust"
-run = "mise x rust@1.88.0 -- cargo check --all-features --lib"
+description = "Check that the crate builds on its minimum supported Rust, and the AWS SDK features on the SDK's"
+run = [
+  "mise x rust@1.88.0 -- cargo check --features axum,tower,test-kit --lib",
+  "mise x rust@1.94.1 -- cargo check --all-features --lib",
+]
 
 [tasks.tofu-check]
 description = "Validate the OpenTofu module and its example, and test it with a mocked provider"

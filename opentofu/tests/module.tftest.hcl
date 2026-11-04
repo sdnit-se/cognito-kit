@@ -98,3 +98,53 @@ run "refuses_an_ambiguous_domain" {
 
   expect_failures = [var.domain]
 }
+
+run "registration_reaches_only_its_pool_and_table" {
+  command = apply
+
+  variables {
+    registration = { template_client = "claude" }
+  }
+
+  assert {
+    condition     = aws_dynamodb_table.registrations[0].hash_key == "pk" && aws_dynamodb_table.registrations[0].billing_mode == "PAY_PER_REQUEST"
+    error_message = "DynamoStore keys items by a string pk."
+  }
+
+  assert {
+    condition = alltrue([
+      for statement in jsondecode(output.registration_policy_json).Statement :
+      alltrue([for resource in statement.Resource : contains([aws_cognito_user_pool.this.arn, aws_dynamodb_table.registrations[0].arn], resource)])
+    ])
+    error_message = "The server may change app clients in its own pool and items in its own table, nowhere else."
+  }
+
+  assert {
+    condition     = output.registration_template_client_id == aws_cognito_user_pool_client.this["claude"].id
+    error_message = "Registered clients copy the template client."
+  }
+}
+
+run "the_registrations_table_name_suits_dynamodb_whatever_the_pool_is_called" {
+  command = plan
+
+  variables {
+    name         = "Portal + docs"
+    registration = { template_client = "claude" }
+  }
+
+  assert {
+    condition     = can(regex("^[a-zA-Z0-9_.-]{3,255}$", aws_dynamodb_table.registrations[0].name))
+    error_message = "DynamoDB refuses a table name with a space or a plus."
+  }
+}
+
+run "registration_needs_a_template_from_the_clients" {
+  command = plan
+
+  variables {
+    registration = { template_client = "missing" }
+  }
+
+  expect_failures = [var.registration]
+}
