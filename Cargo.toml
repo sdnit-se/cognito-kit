@@ -26,7 +26,7 @@ tower = ["dep:tower-layer", "dep:tower-service"]
 base64 = "0.22.1"
 getrandom = "0.3.4"
 http = "1.3.1"
-jsonwebtoken = { version = "11.1.0", default-features = false, features = ["rust_crypto"] }
+ring = { version = "0.17.14", default-features = false, features = ["alloc"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 sha2 = "0.10.9"
@@ -42,6 +42,7 @@ tower-service = { version = "0.3.3", optional = true }
 
 [dev-dependencies]
 axum = { version = "0.8.7", default-features = false, features = ["tokio", "http1", "json"] }
+jsonwebtoken = { version = "11.1.0", default-features = false, features = ["rust_crypto"] }
 rand = "0.8.5"
 rsa = "0.9.8"
 tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread", "net", "time"] }

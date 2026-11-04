@@ -271,3 +271,62 @@ async fn checks_id_tokens_for_their_own_app_client() {
         Err(Rejection::TokenUse)
     ));
 }
+
+#[tokio::test]
+async fn refuses_malformed_tokens_as_malformed() {
+    let valid = sign("k1", &access_claims(MCP, DRAFTS));
+    let (header, rest) = valid.split_once('.').unwrap();
+    let (payload, signature) = rest.split_once('.').unwrap();
+    let with_header = |json: &[u8]| format!("{}.{payload}.{signature}", URL_SAFE_NO_PAD.encode(json));
+    let nested = format!("{}{}", "[".repeat(100_000), "]".repeat(100_000));
+    let malformed = [
+        String::new(),
+        "..".to_owned(),
+        format!("{header}.{payload}"),
+        format!("{valid}.{signature}"),
+        format!("{valid}."),
+        format!("{header}=.{payload}.{signature}"),
+        format!("{header}.{payload}.{signature}!"),
+        format!("{header}.%%%.{signature}"),
+        with_header(b"not json"),
+        with_header(br#"["RS256", "k1"]"#),
+        with_header(br#"{"alg": "RS256"}"#),
+        with_header(nested.as_bytes()),
+        with_header(&[b'{'; 1 << 20]),
+        sign("k1", &json!("not an object")),
+        sign("k1", &json!({ "exp": "tomorrow" })),
+    ];
+    for token in &malformed {
+        assert!(
+            matches!(check(token).await, Err(Rejection::Malformed)),
+            "{:.60}",
+            token
+        );
+    }
+}
+
+#[tokio::test]
+async fn refuses_every_truncated_or_altered_token() {
+    let verifier = verifier(&FakeCognito::publishing(&["k1"]).pool());
+    let valid = sign("k1", &access_claims(MCP, DRAFTS));
+    for end in 0..valid.len() {
+        assert!(
+            verifier.verify::<()>(&valid[..end]).await.is_err(),
+            "cut at {end}"
+        );
+    }
+    for at in 0..valid.len() {
+        for replacement in ['A', '_', '.', '='] {
+            let mut altered = valid.clone().into_bytes();
+            if altered[at] == replacement as u8 {
+                continue;
+            }
+            altered[at] = replacement as u8;
+            let altered = String::from_utf8(altered).unwrap();
+            assert!(
+                verifier.verify::<()>(&altered).await.is_err(),
+                "{replacement} at {at}"
+            );
+        }
+    }
+}

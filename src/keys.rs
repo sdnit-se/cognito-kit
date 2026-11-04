@@ -2,14 +2,35 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use jsonwebtoken::DecodingKey;
-use jsonwebtoken::jwk::{AlgorithmParameters, JwkSet, KeyAlgorithm, PublicKeyUse};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use ring::signature::RsaPublicKeyComponents;
+use serde::Deserialize;
 
 use crate::http_client::{BoxError, Http};
 use crate::verify::Rejection;
 
+pub(crate) type PublicKey = RsaPublicKeyComponents<Vec<u8>>;
+
+#[derive(Deserialize)]
+struct JwkSet {
+    keys: Vec<Jwk>,
+}
+
+/// The members of a JWK that an RS256 key needs (RFC 7517, RFC 7518 section 6.3).
+#[derive(Deserialize)]
+struct Jwk {
+    kty: String,
+    kid: Option<String>,
+    #[serde(rename = "use")]
+    usage: Option<String>,
+    alg: Option<String>,
+    n: Option<String>,
+    e: Option<String>,
+}
+
 struct KeySet {
-    keys: BTreeMap<String, DecodingKey>,
+    keys: BTreeMap<String, PublicKey>,
     fetched: Instant,
 }
 
@@ -51,13 +72,13 @@ impl KeyCache {
         self.current.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    fn fresh(&self, kid: &str) -> Option<DecodingKey> {
+    fn fresh(&self, kid: &str) -> Option<PublicKey> {
         self.current()
             .filter(|set| set.fetched.elapsed() < self.max_age)
             .and_then(|set| set.keys.get(kid).cloned())
     }
 
-    pub(crate) async fn key(&self, kid: &str) -> Result<DecodingKey, Rejection> {
+    pub(crate) async fn key(&self, kid: &str) -> Result<PublicKey, Rejection> {
         if let Some(key) = self.fresh(kid) {
             return Ok(key);
         }
@@ -95,16 +116,15 @@ impl KeyCache {
         let set: JwkSet = self.http.get_json(&self.url).await?;
         let keys = set
             .keys
-            .iter()
-            .filter(|jwk| matches!(jwk.algorithm, AlgorithmParameters::RSA(_)))
-            .filter(|jwk| {
-                jwk.common
-                    .public_key_use
-                    .as_ref()
-                    .is_none_or(|u| *u == PublicKeyUse::Signature)
+            .into_iter()
+            .filter(|jwk| jwk.kty == "RSA")
+            .filter(|jwk| jwk.usage.as_deref().is_none_or(|u| u == "sig"))
+            .filter(|jwk| jwk.alg.as_deref().is_none_or(|a| a == "RS256"))
+            .filter_map(|jwk| {
+                let n = URL_SAFE_NO_PAD.decode(jwk.n?).ok()?;
+                let e = URL_SAFE_NO_PAD.decode(jwk.e?).ok()?;
+                Some((jwk.kid?, PublicKey { n, e }))
             })
-            .filter(|jwk| jwk.common.key_algorithm.is_none_or(|a| a == KeyAlgorithm::RS256))
-            .filter_map(|jwk| Some((jwk.common.key_id.clone()?, DecodingKey::from_jwk(jwk).ok()?)))
             .collect();
         Ok(KeySet {
             keys,

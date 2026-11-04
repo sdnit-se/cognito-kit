@@ -1,10 +1,11 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use http::{HeaderMap, HeaderValue, StatusCode, header};
-use jsonwebtoken::errors::ErrorKind;
-use jsonwebtoken::{Algorithm, Validation};
+use ring::signature::RSA_PKCS1_2048_8192_SHA256;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 use url::Url;
@@ -80,19 +81,6 @@ impl Rejection {
     }
 }
 
-fn rejection(error: &jsonwebtoken::errors::Error) -> Rejection {
-    match error.kind() {
-        ErrorKind::InvalidSignature => Rejection::Signature,
-        ErrorKind::ExpiredSignature => Rejection::Expired,
-        ErrorKind::InvalidIssuer => Rejection::Issuer,
-        ErrorKind::InvalidAudience => Rejection::Audience,
-        ErrorKind::InvalidAlgorithm => Rejection::Algorithm,
-        ErrorKind::MissingRequiredClaim(claim) if claim == "iss" => Rejection::Issuer,
-        ErrorKind::MissingRequiredClaim(claim) if claim == "aud" => Rejection::Audience,
-        _ => Rejection::Malformed,
-    }
-}
-
 /// A refused request, ready to send: the status, a `WWW-Authenticate`
 /// challenge and a small JSON body.
 #[derive(Debug)]
@@ -137,6 +125,21 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
     scheme.eq_ignore_ascii_case("bearer").then(|| token.trim())
 }
 
+fn base64url(segment: &str) -> Result<Vec<u8>, Rejection> {
+    URL_SAFE_NO_PAD.decode(segment).map_err(|_| Rejection::Malformed)
+}
+
+/// `aud` is a string or an array of strings (RFC 7519 section 4.1.3).
+fn has_audience(aud: Option<&Value>, expected: &str) -> bool {
+    match aud {
+        Some(Value::String(aud)) => aud == expected,
+        Some(Value::Array(auds)) => {
+            auds.iter().all(Value::is_string) && auds.iter().any(|aud| aud.as_str() == Some(expected))
+        }
+        _ => false,
+    }
+}
+
 /// Verifies a token's signature, issuer, expiry and kind, and its audience
 /// when `audience` is set, then reads its claims.
 async fn decode<T: DeserializeOwned>(
@@ -146,25 +149,42 @@ async fn decode<T: DeserializeOwned>(
     audience: Option<&str>,
     leeway: Duration,
 ) -> Result<T, Rejection> {
-    let header = jsonwebtoken::decode_header(token).map_err(|_| Rejection::Malformed)?;
-    let kid = header.kid.ok_or(Rejection::Malformed)?;
-    let key = pool.keys().key(&kid).await?;
-    let mut validation = Validation::new(Algorithm::RS256);
-    validation.leeway = leeway.as_secs();
-    validation.set_issuer(&[pool.issuer()]);
-    match audience {
-        Some(aud) => {
-            validation.set_audience(&[aud]);
-            validation.set_required_spec_claims(&["exp", "iss", "aud"]);
-        }
-        None => {
-            validation.validate_aud = false;
-            validation.set_required_spec_claims(&["exp", "iss"]);
-        }
+    // A fourth segment leaves a '.' in the payload, which base64url refuses.
+    let (signed, signature) = token.rsplit_once('.').ok_or(Rejection::Malformed)?;
+    let (header, payload) = signed.split_once('.').ok_or(Rejection::Malformed)?;
+    let header: Map<String, Value> =
+        serde_json::from_slice(&base64url(header)?).map_err(|_| Rejection::Malformed)?;
+    let payload = base64url(payload)?;
+    let signature = base64url(signature)?;
+    match header.get("alg").and_then(Value::as_str) {
+        Some("RS256") => {}
+        Some(_) => return Err(Rejection::Algorithm),
+        None => return Err(Rejection::Malformed),
     }
-    let claims = jsonwebtoken::decode::<Map<String, Value>>(token, &key, &validation)
-        .map_err(|e| rejection(&e))?
-        .claims;
+    let kid = header
+        .get("kid")
+        .and_then(Value::as_str)
+        .ok_or(Rejection::Malformed)?;
+    let key = pool.keys().key(kid).await?;
+    key.verify(&RSA_PKCS1_2048_8192_SHA256, signed.as_bytes(), &signature)
+        .map_err(|_| Rejection::Signature)?;
+    let claims: Map<String, Value> = serde_json::from_slice(&payload).map_err(|_| Rejection::Malformed)?;
+    let exp = claims
+        .get("exp")
+        .and_then(Value::as_u64)
+        .ok_or(Rejection::Malformed)?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    if exp.saturating_add(leeway.as_secs()) < now.as_secs() {
+        return Err(Rejection::Expired);
+    }
+    if claims.get("iss").and_then(Value::as_str) != Some(pool.issuer()) {
+        return Err(Rejection::Issuer);
+    }
+    if let Some(audience) = audience
+        && !has_audience(claims.get("aud"), audience)
+    {
+        return Err(Rejection::Audience);
+    }
     // Checked before the claims' shape, so an ID token sent as an access
     // token is refused as the wrong kind rather than as malformed.
     if claims.get("token_use").and_then(Value::as_str) != Some(token_use) {
