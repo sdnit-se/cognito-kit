@@ -451,6 +451,9 @@ fn refuses_at_startup_a_name_prefix_that_cognito_would_refuse() {
     };
     assert!(build("team/portal").is_err());
     assert!(build("portal-2 eu").is_ok());
+    // Cut short in a name, cleanup wouldn't know its app clients.
+    assert!(build(&"p".repeat(65)).is_err());
+    assert!(build(&"p".repeat(64)).is_ok());
 }
 
 #[tokio::test]

@@ -353,8 +353,9 @@ impl RegistrarBuilder {
 
     /// The start of every app client name the registrar gives. Cleanup
     /// deletes app clients with this prefix that it has no registration
-    /// for, so each registrar sharing a pool needs its own. Defaults to
-    /// `cognito-kit`.
+    /// for, so each registrar sharing a pool needs its own. At most 64
+    /// characters, so that a name fits Cognito's 128 with the prefix whole.
+    /// Defaults to `cognito-kit`.
     pub fn name_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.name_prefix = prefix.into();
         self
@@ -374,6 +375,13 @@ impl RegistrarBuilder {
         if !self.name_prefix.chars().all(name_char) {
             return Err(ConfigError::Registration(
                 "the app client name prefix has a character Cognito refuses in a name",
+            ));
+        }
+        // Names are cut at 128 characters; cleanup knows its own by the
+        // whole prefix and the space after it.
+        if self.name_prefix.chars().count() > 64 {
+            return Err(ConfigError::Registration(
+                "the app client name prefix is longer than 64 characters",
             ));
         }
         Ok(Registrar {
