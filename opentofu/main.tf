@@ -136,3 +136,52 @@ resource "aws_cognito_managed_login_branding" "this" {
 
   depends_on = [aws_cognito_user_pool_domain.this]
 }
+
+resource "aws_dynamodb_table" "registrations" {
+  count = var.registration == null ? 0 : 1
+
+  name                        = coalesce(var.registration.table_name, "${var.name}-registrations")
+  billing_mode                = "PAY_PER_REQUEST"
+  hash_key                    = "pk"
+  deletion_protection_enabled = var.deletion_protection
+  tags                        = var.tags
+
+  attribute {
+    name = "pk"
+    type = "S"
+  }
+
+  point_in_time_recovery {
+    enabled = true
+  }
+}
+
+locals {
+  # What the Registrar does, and nothing else: app clients in this pool,
+  # their managed login styles, and its own table.
+  registration_policy = var.registration == null ? null : jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "AppClients"
+        Effect = "Allow"
+        Action = [
+          "cognito-idp:CreateUserPoolClient",
+          "cognito-idp:UpdateUserPoolClient",
+          "cognito-idp:DeleteUserPoolClient",
+          "cognito-idp:DescribeUserPoolClient",
+          "cognito-idp:ListUserPoolClients",
+          "cognito-idp:CreateManagedLoginBranding",
+          "cognito-idp:DescribeManagedLoginBrandingByClient",
+        ]
+        Resource = [aws_cognito_user_pool.this.arn]
+      },
+      {
+        Sid      = "Registrations"
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem", "dynamodb:Scan"]
+        Resource = [aws_dynamodb_table.registrations[0].arn]
+      },
+    ]
+  })
+}
