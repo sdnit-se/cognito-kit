@@ -21,7 +21,9 @@ themselves, and each gets an app client of its own; nobody types a client id.
   consent step, so https redirect URIs must be on a host listed with
   `client_hosts`, checked on every authorization, so a host taken off the
   list gets no more codes through the front, even for clients registered
-  while it was on. Loopback ones match on any port: Cognito sends their codes
+  while it was on. Their app clients still list it as a callback, so run
+  `Registrar::cleanup` after taking a host off: it removes them. Loopback
+  ones match on any port: Cognito sends their codes
   to the front's `/oauth2/callback`, which passes each on to the loopback
   URI its authorization started with.
 - **Limits and cleanup.** At `max_registrations` (500 by default), or at

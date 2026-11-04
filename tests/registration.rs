@@ -184,6 +184,13 @@ async fn a_host_taken_off_the_trusted_list_gets_no_more_codes() {
     let answer = get(&server.front, &url).await;
     assert_eq!(answer.status(), StatusCode::BAD_REQUEST);
     assert_eq!(location(&answer), None, "never redirected to the untrusted host");
+
+    // Its app client still lists the host, and Cognito's authorize is
+    // public, so cleanup removes it.
+    let report = server.registrar.cleanup().await.unwrap();
+    assert_eq!(report.untrusted, 1);
+    assert!(server.cognito.app_clients().is_empty());
+    assert!(server.store.registrations().is_empty());
 }
 
 #[tokio::test]

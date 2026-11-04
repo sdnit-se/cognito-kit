@@ -237,6 +237,15 @@ pub struct Cleanup {
     /// App clients with the registrar's name prefix and no registration,
     /// left by a server that stopped between creating and storing one.
     pub orphans: usize,
+    /// Registrations with a redirect URI on a host no longer trusted.
+    pub untrusted: usize,
+}
+
+/// Why cleanup removes a registration.
+enum Removal {
+    Untrusted,
+    Unused,
+    Idle,
 }
 
 /// Registers clients that bring their own identity, and maps each to a
@@ -718,58 +727,73 @@ impl Registrar {
         Ok(())
     }
 
+    /// Why cleanup removes `registration` at `now`, if it does.
+    fn removal(&self, registration: &Registration, now: u64) -> Option<Removal> {
+        if registration.redirect_uris.iter().any(|uri| !self.trusted(uri)) {
+            return Some(Removal::Untrusted);
+        }
+        match registration.last_used {
+            None if now.saturating_sub(registration.created_at) > self.inner.unused_after.as_secs() => {
+                Some(Removal::Unused)
+            }
+            Some(at) if now.saturating_sub(at) > self.inner.idle_after.as_secs() => Some(Removal::Idle),
+            _ => None,
+        }
+    }
+
     /// Removes registrations nobody uses, and their app clients: those that
     /// never completed a token request within `unused_after`, and those
-    /// idle for longer than `idle_after`. Also deletes app clients with
-    /// this registrar's name prefix that have no registration and are more
-    /// than an hour old.
+    /// idle for longer than `idle_after`. Also removes those with an https
+    /// redirect URI on a host no longer in `client_hosts`: the front sends
+    /// them no codes, but their app client still lists the host as a
+    /// callback, and Cognito's own authorize endpoint is public. And it
+    /// deletes app clients with this registrar's name prefix that have no
+    /// registration and are more than an hour old.
     ///
     /// A removed client's tokens are refused from then on, after at most a
     /// minute in servers that checked one of them recently.
     ///
-    /// Run it on a schedule, such as daily. Every registration is listed,
-    /// and Cognito allows five app-client changes per second per pool, so
-    /// a large cleanup takes a while.
+    /// Run it on a schedule, such as daily, and at once after taking a host
+    /// off `client_hosts`. Every registration is listed, and Cognito allows
+    /// five app-client changes per second per pool, so a large cleanup
+    /// takes a while.
     pub async fn cleanup(&self) -> Result<Cleanup, RegistrationError> {
         let mut report = Cleanup::default();
         let now = now();
         let registrations = self.inner.store.list().await.map_err(unavailable)?;
         let mut owned = BTreeSet::new();
         for registration in registrations {
-            let unused = registration.last_used.is_none()
-                && now.saturating_sub(registration.created_at) > self.inner.unused_after.as_secs();
-            let idle = registration
-                .last_used
-                .is_some_and(|at| now.saturating_sub(at) > self.inner.idle_after.as_secs());
-            if !unused && !idle {
+            if self.removal(&registration, now).is_none() {
                 owned.insert(registration.app_client);
                 continue;
             }
             // A token request may have used it since the list, which took
-            // a while to work through.
+            // a while to work through, or it may have been registered again.
             let current = self
                 .inner
                 .store
                 .get(&registration.client_id)
                 .await
                 .map_err(unavailable)?;
-            if let Some(current) = current
-                && (current.app_client != registration.app_client
-                    || current.last_used != registration.last_used)
-            {
-                owned.insert(current.app_client);
+            let removal = match &current {
+                Some(current) if current.app_client == registration.app_client => self.removal(current, now),
+                Some(_) => None,
+                None => self.removal(&registration, now),
+            };
+            let Some(removal) = removal else {
+                owned.extend(current.map(|current| current.app_client));
                 continue;
-            }
+            };
             self.inner.app_clients.delete(&registration.app_client).await?;
             self.inner
                 .store
                 .remove(&registration)
                 .await
                 .map_err(unavailable)?;
-            if unused {
-                report.unused += 1;
-            } else {
-                report.idle += 1;
+            match removal {
+                Removal::Untrusted => report.untrusted += 1,
+                Removal::Unused => report.unused += 1,
+                Removal::Idle => report.idle += 1,
             }
         }
         let prefix = format!("{} ", self.inner.name_prefix);
