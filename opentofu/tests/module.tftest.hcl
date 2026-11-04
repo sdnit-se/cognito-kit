@@ -125,6 +125,20 @@ run "registration_reaches_only_its_pool_and_table" {
   }
 }
 
+run "the_registrations_table_name_suits_dynamodb_whatever_the_pool_is_called" {
+  command = plan
+
+  variables {
+    name         = "Portal + docs"
+    registration = { template_client = "claude" }
+  }
+
+  assert {
+    condition     = can(regex("^[a-zA-Z0-9_.-]{3,255}$", aws_dynamodb_table.registrations[0].name))
+    error_message = "DynamoDB refuses a table name with a space or a plus."
+  }
+}
+
 run "registration_needs_a_template_from_the_clients" {
   command = plan
 

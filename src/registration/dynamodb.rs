@@ -113,7 +113,8 @@ impl DynamoStore {
                 AttributeValue::S(format!("client#{}", registration.client_id)),
             )
             .update_expression("SET redirect_uris = :uris, client_name = :name, fetched_at = :at")
-            .condition_expression("attribute_exists(pk)")
+            .condition_expression("app_client = :app")
+            .expression_attribute_values(":app", AttributeValue::S(registration.app_client.to_string()))
             .expression_attribute_values(":uris", AttributeValue::L(uris))
             .expression_attribute_values(":name", name)
             .expression_attribute_values(":at", AttributeValue::N(registration.fetched_at.to_string()))

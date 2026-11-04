@@ -140,7 +140,8 @@ resource "aws_cognito_managed_login_branding" "this" {
 resource "aws_dynamodb_table" "registrations" {
   count = var.registration == null ? 0 : 1
 
-  name                        = coalesce(var.registration.table_name, "${var.name}-registrations")
+  # A pool's name may hold spaces and `+`; a table's may not.
+  name                        = coalesce(var.registration.table_name, replace("${var.name}-registrations", "/[^a-zA-Z0-9_.-]/", "-"))
   billing_mode                = "PAY_PER_REQUEST"
   hash_key                    = "pk"
   deletion_protection_enabled = var.deletion_protection

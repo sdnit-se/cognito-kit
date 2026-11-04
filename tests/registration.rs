@@ -4,15 +4,17 @@
 
 mod front;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use cognito_kit::registration::{BoxFuture, Registrar, Registration, RegistrationStore};
-use cognito_kit::test_kit::MemoryStore;
+use cognito_kit::test_kit::{FakeCognito, MemoryStore};
 use cognito_kit::{BoxError, ClientId};
 
 use front::{
-    Authorization, DRAFTS, MCP, ORIGIN, call_mcp, get, json, location, open_server, post_form, post_json,
-    server, sign_in,
+    Authorization, DRAFTS, Documents, MCP, ORIGIN, call_mcp, get, json, location, open_server, post_form,
+    post_json, serve, server, sign_in,
 };
 use http::StatusCode;
 use serde_json::json;
@@ -163,6 +165,25 @@ async fn sends_codes_only_to_the_device_or_a_trusted_host() {
         !callbacks.iter().any(|c| c.contains("evil.example")),
         "{callbacks:?}"
     );
+}
+
+#[tokio::test]
+async fn a_host_taken_off_the_trusted_list_gets_no_more_codes() {
+    let server = open_server();
+    let registered = json(&post_json(&server.front, REGISTER, &registration(&[CLAUDE_CALLBACK])).await);
+    let url = authorize_url(registered["client_id"].as_str().unwrap(), CLAUDE_CALLBACK, true);
+    assert_eq!(get(&server.front, &url).await.status(), StatusCode::FOUND);
+
+    // The operator stops trusting claude.ai and restarts the server.
+    let registrar = Registrar::builder(server.cognito.clone(), server.store.clone())
+        .dynamic_registration()
+        .client_hosts(["chatgpt.com"])
+        .build()
+        .unwrap();
+    let server = serve(server.cognito, server.store, server.documents, registrar);
+    let answer = get(&server.front, &url).await;
+    assert_eq!(answer.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(location(&answer), None, "never redirected to the untrusted host");
 }
 
 #[tokio::test]
@@ -390,7 +411,7 @@ async fn the_relay_sends_a_code_only_back_to_the_device() {
 }
 
 #[tokio::test]
-async fn a_stale_removal_leaves_a_newer_registration() {
+async fn stale_writes_leave_a_newer_registration() {
     let server = open_server();
     server
         .documents
@@ -401,11 +422,28 @@ async fn a_stale_removal_leaves_a_newer_registration() {
     server.store.remove(&first).await.unwrap();
     // The next sign-in registers the document again, with a new app client.
     assert_eq!(get(&server.front, &url).await.status(), StatusCode::FOUND);
-    // A cleanup that listed the first registration removes it late.
+    // A refresh that read the first registration stores its fetch late,
+    // and a cleanup that listed it removes it late.
+    let mut refreshed = first.clone();
+    refreshed.redirect_uris = vec!["https://claude.ai/api/mcp/old_callback".into()];
+    server.store.update(&refreshed).await.unwrap();
     server.store.remove(&first).await.unwrap();
     let left = server.store.registrations();
     assert_eq!(left.len(), 1);
     assert_ne!(left[0].app_client, first.app_client);
+    assert_eq!(left[0].redirect_uris, [CLAUDE_CALLBACK]);
+}
+
+#[test]
+fn refuses_at_startup_a_name_prefix_that_cognito_would_refuse() {
+    let build = |prefix: &str| {
+        Registrar::builder(FakeCognito::new(), MemoryStore::new())
+            .dynamic_registration()
+            .name_prefix(prefix)
+            .build()
+    };
+    assert!(build("team/portal").is_err());
+    assert!(build("portal-2 eu").is_ok());
 }
 
 #[tokio::test]
@@ -428,14 +466,17 @@ async fn leaves_an_app_client_managed_by_hand_to_cognito() {
     );
 }
 
-/// A store in which a token request uses `client` right after a cleanup
-/// lists the registrations.
-struct UsedAfterTheList {
+/// A store with faults: a token request that uses `used_after_list` right
+/// after a cleanup lists the registrations, and touches that fail while
+/// `touch_fails` is set.
+#[derive(Default)]
+struct Faulty {
     store: MemoryStore,
-    client: String,
+    used_after_list: Option<String>,
+    touch_fails: Arc<AtomicBool>,
 }
 
-impl RegistrationStore for UsedAfterTheList {
+impl RegistrationStore for Faulty {
     fn get<'a>(&'a self, client_id: &'a str) -> BoxFuture<'a, Result<Option<Registration>, BoxError>> {
         self.store.get(client_id)
     }
@@ -452,6 +493,9 @@ impl RegistrationStore for UsedAfterTheList {
         self.store.update(registration)
     }
     fn touch<'a>(&'a self, client_id: &'a str, at: u64) -> BoxFuture<'a, Result<(), BoxError>> {
+        if self.touch_fails.load(Ordering::SeqCst) {
+            return Box::pin(async { Err("throttled".into()) });
+        }
         self.store.touch(client_id, at)
     }
     fn remove<'a>(&'a self, registration: &'a Registration) -> BoxFuture<'a, Result<(), BoxError>> {
@@ -464,7 +508,9 @@ impl RegistrationStore for UsedAfterTheList {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs();
-            self.store.touch(&self.client, now).await?;
+            if let Some(client) = &self.used_after_list {
+                self.store.touch(client, now).await?;
+            }
             listed
         })
     }
@@ -485,9 +531,10 @@ async fn cleanup_keeps_a_client_used_while_it_ran() {
         .edit(&client, |r| r.last_used = Some(r.created_at - 40 * 24 * 3600));
     let registrar = Registrar::builder(
         server.cognito.clone(),
-        UsedAfterTheList {
+        Faulty {
             store: server.store.clone(),
-            client: client.clone(),
+            used_after_list: Some(client.clone()),
+            ..Faulty::default()
         },
     )
     .dynamic_registration()
@@ -497,5 +544,41 @@ async fn cleanup_keeps_a_client_used_while_it_ran() {
     let report = registrar.cleanup().await.unwrap();
     assert_eq!((report.unused, report.idle, report.orphans), (0, 0, 0));
     assert_eq!(server.cognito.app_clients().len(), 1, "its app client stays");
+    assert_eq!(server.store.registrations().len(), 1);
+}
+
+#[tokio::test]
+async fn cleanup_keeps_a_client_whose_first_use_failed_to_record() {
+    let cognito = FakeCognito::new();
+    let store = MemoryStore::new();
+    let touch_fails = Arc::new(AtomicBool::new(true));
+    let faulty = Faulty {
+        store: store.clone(),
+        touch_fails: touch_fails.clone(),
+        ..Faulty::default()
+    };
+    let registrar = Registrar::builder(cognito.clone(), faulty)
+        .dynamic_registration()
+        .build()
+        .unwrap();
+    let server = serve(cognito, store, Documents::default(), registrar);
+    let redirect_uri = "http://127.0.0.1:9000/cb";
+    let answer = post_json(&server.front, REGISTER, &registration(&[redirect_uri])).await;
+    let client = json(&answer)["client_id"].as_str().unwrap().to_owned();
+    let auth = Authorization {
+        client_id: &client,
+        redirect_uri,
+        scope: DRAFTS,
+        resource: Some(MCP),
+        extra: &[],
+    };
+    sign_in(&server, &auth).await.unwrap();
+    // The store failed to record that use, and is back for the next.
+    touch_fails.store(false, Ordering::SeqCst);
+    sign_in(&server, &auth).await.unwrap();
+
+    server.store.edit(&client, |r| r.created_at -= 2 * 24 * 3600);
+    let report = server.registrar.cleanup().await.unwrap();
+    assert_eq!(report.unused, 0, "a client in use is not unused");
     assert_eq!(server.store.registrations().len(), 1);
 }

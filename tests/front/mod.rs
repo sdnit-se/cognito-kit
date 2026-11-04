@@ -66,6 +66,12 @@ pub fn server(configure: impl FnOnce(RegistrarBuilder, Documents) -> RegistrarBu
     let documents = Documents::default();
     let builder = Registrar::builder(cognito.clone(), store.clone());
     let registrar = configure(builder, documents.clone()).build().unwrap();
+    serve(cognito, store, documents, registrar)
+}
+
+/// A server with `registrar` over a pool and store that may already hold
+/// registrations, as after a restart with other settings.
+pub fn serve(cognito: FakeCognito, store: MemoryStore, documents: Documents, registrar: Registrar) -> Server {
     let verifier = cognito
         .pool()
         .access_tokens()

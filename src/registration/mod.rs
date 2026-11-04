@@ -112,7 +112,9 @@ pub trait RegistrationStore: Send + Sync + 'static {
     /// what is stored under that `client_id` afterwards. Two servers that
     /// register one client at once both get the first one's registration.
     fn insert(&self, registration: Registration) -> BoxFuture<'_, Result<Registration, BoxError>>;
-    /// Replaces the stored `redirect_uris`, `client_name` and `fetched_at`.
+    /// Replaces the stored `redirect_uris`, `client_name` and `fetched_at`,
+    /// unless the `client_id` has since been registered again with another
+    /// app client.
     fn update<'a>(&'a self, registration: &'a Registration) -> BoxFuture<'a, Result<(), BoxError>>;
     /// Sets `last_used`.
     fn touch<'a>(&'a self, client_id: &'a str, at: u64) -> BoxFuture<'a, Result<(), BoxError>>;
@@ -360,6 +362,11 @@ impl RegistrarBuilder {
         if self.name_prefix.trim().is_empty() {
             return Err(ConfigError::Registration("the app client name prefix is empty"));
         }
+        if !self.name_prefix.chars().all(name_char) {
+            return Err(ConfigError::Registration(
+                "the app client name prefix has a character Cognito refuses in a name",
+            ));
+        }
         Ok(Registrar {
             inner: Arc::new(Inner {
                 app_clients: self.app_clients,
@@ -468,6 +475,13 @@ impl Registrar {
         };
         redirect::find(&registration.redirect_uris, redirect_uri)
             .ok_or(RegistrationError::RedirectMismatch)?;
+        // Checked on every request, so that a host taken off `client_hosts`
+        // gets no more codes through the front, even for stored clients.
+        if !self.trusted(redirect_uri) {
+            return Err(RegistrationError::InvalidRedirectUri(
+                self.untrusted(redirect_uri),
+            ));
+        }
         Ok(Authorize::Registered {
             app_client: registration.app_client,
             relay: redirect::loopback(redirect_uri).is_some(),
@@ -507,9 +521,12 @@ impl Registrar {
             return;
         }
         remember(&self.inner.touched, client_id.clone(), TOUCH_EVERY);
-        // Losing a touch only makes cleanup see the client as idle an hour
-        // early, against a month-long window.
-        let _ = self.inner.store.touch(client_id, now()).await;
+        // Until a first touch lands, cleanup sees the client as never used,
+        // so a failed one is tried again on the next token request.
+        if self.inner.store.touch(client_id, now()).await.is_err() {
+            let mut touched = self.inner.touched.lock().unwrap_or_else(|e| e.into_inner());
+            touched.remove(client_id);
+        }
     }
 
     /// Registers a client from an RFC 7591 request.
@@ -793,9 +810,12 @@ fn callbacks(redirect_uris: &[String], relay: &str) -> Vec<String> {
 }
 
 /// Cognito allows `[\w\s+=,.@-]` and 128 characters in a client name.
+fn name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || " _+=,.@-".contains(c)
+}
+
 fn app_client_name(prefix: &str, name: &str) -> String {
-    let allowed = |c: &char| c.is_ascii_alphanumeric() || " _+=,.@-".contains(*c);
-    let name: String = name.chars().filter(allowed).collect();
+    let name: String = name.chars().filter(|c| name_char(*c)).collect();
     let name = format!("{prefix} {}", name.trim());
     name.chars().take(128).collect()
 }

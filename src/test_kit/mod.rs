@@ -197,7 +197,8 @@ impl FakeCognito {
     /// Adds an app client, as you would with OpenTofu.
     pub fn add_client(&self, name: &str, callback_urls: &[&str]) -> ClientId {
         let urls: Vec<String> = callback_urls.iter().map(|u| (*u).to_owned()).collect();
-        self.create_client(name, &urls).expect("no limit set")
+        self.create_client(name, &urls)
+            .unwrap_or_else(|error| panic!("the fake Cognito refused the app client: {error}"))
     }
 
     /// The pool's app clients.
@@ -461,7 +462,8 @@ mod registration {
         }
 
         /// Changes a stored registration, for tests that need one in a given
-        /// state, such as long unused.
+        /// state, such as long unused. `change` runs with the store locked,
+        /// so it must not use the store.
         pub fn edit(&self, client_id: &str, change: impl FnOnce(&mut Registration)) {
             if let Some(registration) = self.0.lock().unwrap().get_mut(client_id) {
                 change(registration);
@@ -502,7 +504,11 @@ mod registration {
         }
 
         fn update<'a>(&'a self, registration: &'a Registration) -> BoxFuture<'a, Result<(), BoxError>> {
-            if let Some(stored) = self.0.lock().unwrap().get_mut(&registration.client_id) {
+            let mut all = self.0.lock().unwrap();
+            let stored = all
+                .get_mut(&registration.client_id)
+                .filter(|r| r.app_client == registration.app_client);
+            if let Some(stored) = stored {
                 stored.redirect_uris = registration.redirect_uris.clone();
                 stored.client_name = registration.client_name.clone();
                 stored.fetched_at = registration.fetched_at;
