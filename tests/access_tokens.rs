@@ -242,6 +242,13 @@ async fn refuses_a_token_whose_signature_was_tampered_with() {
     assert!(matches!(check(&forged).await, Err(Rejection::Signature)));
 }
 
+#[cfg(feature = "reqwest")]
+#[test]
+fn the_default_client_leaves_the_process_wide_tls_provider_to_the_program() {
+    let _pool = UserPool::new(support::POOL.parse().unwrap());
+    assert!(rustls::crypto::CryptoProvider::get_default().is_none());
+}
+
 #[tokio::test]
 async fn needs_at_least_one_app_client() {
     let pool = FakeCognito::default().pool();

@@ -15,8 +15,9 @@ include = ["/src", "/examples", "/tests/*.rs", "/tests/support", "/README.md", "
 
 [features]
 default = ["reqwest"]
-# The default HTTP client for fetching keys and calling Cognito's token endpoint.
-reqwest = ["dep:reqwest"]
+# The default HTTP client for fetching keys and calling Cognito's token endpoint:
+# reqwest over rustls with ring, trusting the system's root certificates.
+reqwest = ["dep:reqwest", "dep:rustls", "dep:rustls-platform-verifier"]
 # An extractor for verified access-token claims and the MCP front's routes.
 axum = ["dep:axum"]
 # A layer that admits only requests with a valid access token.
@@ -36,7 +37,9 @@ tokio = { version = "1.48.0", default-features = false, features = ["sync"] }
 url = "2.5.7"
 
 axum = { version = "0.8.7", optional = true, default-features = false }
-reqwest = { version = "0.13.1", optional = true, default-features = false, features = ["rustls"] }
+reqwest = { version = "0.13.1", optional = true, default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23.46", optional = true, default-features = false, features = ["ring"] }
+rustls-platform-verifier = { version = "0.7.1", optional = true }
 tower-layer = { version = "0.3.3", optional = true }
 tower-service = { version = "0.3.3", optional = true }
 

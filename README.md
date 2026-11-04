@@ -31,7 +31,7 @@ cargo add cognito-kit
 
 | Feature   | Default | What it adds |
 |-----------|---------|--------------|
-| `reqwest` | yes     | `UserPool::new`, with a reqwest client (rustls) for fetching keys and calling the token endpoint |
+| `reqwest` | yes     | `UserPool::new`, with a reqwest client for fetching keys and calling the token endpoint: rustls with ring, trusting the system's root certificates |
 | `axum`    | no      | `AccessClaims` as an extractor, and `OAuthFront::router` |
 | `tower`   | no      | `RequireBearerLayer`, which admits only requests with a valid token |
 
