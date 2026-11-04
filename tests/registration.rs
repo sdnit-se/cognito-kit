@@ -6,7 +6,9 @@ mod front;
 
 use std::time::Duration;
 
-use cognito_kit::registration::RegistrationStore;
+use cognito_kit::registration::{BoxFuture, Registrar, Registration, RegistrationStore};
+use cognito_kit::test_kit::MemoryStore;
+use cognito_kit::{BoxError, ClientId};
 
 use front::{
     Authorization, DRAFTS, MCP, ORIGIN, call_mcp, get, json, location, open_server, post_form, post_json,
@@ -206,7 +208,7 @@ async fn refuses_a_token_from_an_app_client_it_did_not_register() {
         )
         .await,
     );
-    let client: cognito_kit::ClientId = registered["client_id"].as_str().unwrap().parse().unwrap();
+    let client: ClientId = registered["client_id"].as_str().unwrap().parse().unwrap();
     let token = server.cognito.access_token(&client, Some(MCP), DRAFTS);
     server
         .store
@@ -404,4 +406,96 @@ async fn a_stale_removal_leaves_a_newer_registration() {
     let left = server.store.registrations();
     assert_eq!(left.len(), 1);
     assert_ne!(left[0].app_client, first.app_client);
+}
+
+#[tokio::test]
+async fn leaves_an_app_client_managed_by_hand_to_cognito() {
+    let server = open_server();
+    // A confidential client without PKCE, as an operator may have set one up.
+    let url = authorize_url("3hand4managed5client6", "https://app.example.com/callback", false);
+    let answer = get(&server.front, &url).await;
+    assert_eq!(answer.status(), StatusCode::FOUND);
+    let to = location(&answer).expect("sent on to Cognito");
+    assert_ne!(to.host_str(), Url::parse(ORIGIN).unwrap().host_str());
+    assert_eq!(to.path(), "/oauth2/authorize");
+    let sent: std::collections::BTreeMap<String, String> = to.query_pairs().into_owned().collect();
+    assert_eq!(sent["client_id"], "3hand4managed5client6");
+    assert_eq!(sent["redirect_uri"], "https://app.example.com/callback");
+    assert!(!sent.contains_key("code_challenge"), "{sent:?}");
+    assert!(
+        server.cognito.app_clients().is_empty(),
+        "no app client made for it"
+    );
+}
+
+/// A store in which a token request uses `client` right after a cleanup
+/// lists the registrations.
+struct UsedAfterTheList {
+    store: MemoryStore,
+    client: String,
+}
+
+impl RegistrationStore for UsedAfterTheList {
+    fn get<'a>(&'a self, client_id: &'a str) -> BoxFuture<'a, Result<Option<Registration>, BoxError>> {
+        self.store.get(client_id)
+    }
+    fn get_by_app_client<'a>(
+        &'a self,
+        app_client: &'a ClientId,
+    ) -> BoxFuture<'a, Result<Option<Registration>, BoxError>> {
+        self.store.get_by_app_client(app_client)
+    }
+    fn insert(&self, registration: Registration) -> BoxFuture<'_, Result<Registration, BoxError>> {
+        self.store.insert(registration)
+    }
+    fn update<'a>(&'a self, registration: &'a Registration) -> BoxFuture<'a, Result<(), BoxError>> {
+        self.store.update(registration)
+    }
+    fn touch<'a>(&'a self, client_id: &'a str, at: u64) -> BoxFuture<'a, Result<(), BoxError>> {
+        self.store.touch(client_id, at)
+    }
+    fn remove<'a>(&'a self, registration: &'a Registration) -> BoxFuture<'a, Result<(), BoxError>> {
+        self.store.remove(registration)
+    }
+    fn list(&self) -> BoxFuture<'_, Result<Vec<Registration>, BoxError>> {
+        Box::pin(async {
+            let listed = self.store.list().await;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            self.store.touch(&self.client, now).await?;
+            listed
+        })
+    }
+}
+
+#[tokio::test]
+async fn cleanup_keeps_a_client_used_while_it_ran() {
+    let server = open_server();
+    let answer = post_json(
+        &server.front,
+        REGISTER,
+        &registration(&["http://127.0.0.1:9000/cb"]),
+    )
+    .await;
+    let client = json(&answer)["client_id"].as_str().unwrap().to_owned();
+    server
+        .store
+        .edit(&client, |r| r.last_used = Some(r.created_at - 40 * 24 * 3600));
+    let registrar = Registrar::builder(
+        server.cognito.clone(),
+        UsedAfterTheList {
+            store: server.store.clone(),
+            client: client.clone(),
+        },
+    )
+    .dynamic_registration()
+    .build()
+    .unwrap();
+
+    let report = registrar.cleanup().await.unwrap();
+    assert_eq!((report.unused, report.idle, report.orphans), (0, 0, 0));
+    assert_eq!(server.cognito.app_clients().len(), 1, "its app client stays");
+    assert_eq!(server.store.registrations().len(), 1);
 }

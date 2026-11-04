@@ -728,6 +728,21 @@ impl Registrar {
                 owned.insert(registration.app_client);
                 continue;
             }
+            // A token request may have used it since the list, which took
+            // a while to work through.
+            let current = self
+                .inner
+                .store
+                .get(&registration.client_id)
+                .await
+                .map_err(unavailable)?;
+            if let Some(current) = current
+                && (current.app_client != registration.app_client
+                    || current.last_used != registration.last_used)
+            {
+                owned.insert(current.app_client);
+                continue;
+            }
             self.inner.app_clients.delete(&registration.app_client).await?;
             self.inner
                 .store

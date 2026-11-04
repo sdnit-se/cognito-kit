@@ -25,7 +25,12 @@ themselves, and each gets an app client of its own; nobody types a client id.
 - **Limits and cleanup.** At `max_registrations` (500 by default), or at
   Cognito's quota of 1,000 app clients per pool, new clients get a 503 and
   registered ones keep working. `Registrar::cleanup` removes registrations
-  that were never used or have been idle, and orphaned app clients.
+  that were never used or have been idle, and orphaned app clients. It reads
+  each registration again before removing it, and keeps one used since the
+  list.
+- **App clients you manage by hand pass through unchanged.** The front checks
+  the code grant and PKCE only for clients it registered; Cognito checks the
+  rest, as it did before.
 - **`DynamoStore`**, with the `dynamodb` feature, keeps registrations in a
   table that the OpenTofu module's new `registration` variable creates,
   together with a least-privilege IAM policy.

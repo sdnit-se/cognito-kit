@@ -201,13 +201,18 @@ impl Endpoints {
                 None => page(StatusCode::BAD_REQUEST, description),
             }
         };
-        if param(&pairs, "response_type") != Some("code") {
+        // A registered client is public, so it must use the code grant with
+        // PKCE. An app client someone manages by hand goes to Cognito as it
+        // would without this front, and Cognito checks its request.
+        if registered && param(&pairs, "response_type") != Some("code") {
             return refuse(
                 "unsupported_response_type",
                 "only the authorization code grant is supported",
             );
         }
-        if param(&pairs, "code_challenge").is_none() || param(&pairs, "code_challenge_method") != Some("S256")
+        if registered
+            && (param(&pairs, "code_challenge").is_none()
+                || param(&pairs, "code_challenge_method") != Some("S256"))
         {
             return refuse(
                 "invalid_request",
