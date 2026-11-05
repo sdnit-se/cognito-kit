@@ -58,6 +58,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+To get a token to try it with, use the client credentials grant. It needs
+an app client with a secret, that grant turned on, and a scope from a
+resource server. Ask your managed login domain's token endpoint:
+
+```sh
+TOKEN=$(curl -s -u "$CLIENT_ID:$CLIENT_SECRET" \
+  -d grant_type=client_credentials -d scope=https://api.example.com/read \
+  https://login.example.com/oauth2/token | jq -r .access_token)
+cargo run -- "$TOKEN"
+```
+
+It prints the token's subject and app client. For this grant, both are the
+app client's id.
+
 `verify` checks the signature against the pool's published keys, which it
 fetches once and caches, and then the issuer, expiry, token kind and app
 client. In a web service, build the verifier once and call `authenticate`

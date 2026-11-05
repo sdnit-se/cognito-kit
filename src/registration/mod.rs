@@ -262,7 +262,11 @@ enum Removal {
 ///
 /// # Examples
 ///
+/// With the `dynamodb` feature for the store:
+///
 /// ```
+/// # #[cfg(feature = "dynamodb")]
+/// # mod example {
 /// use cognito_kit::registration::{CognitoApi, DynamoStore, Registrar};
 ///
 /// fn registrar(
@@ -281,6 +285,7 @@ enum Removal {
 ///     .build()?;
 ///     Ok(registrar)
 /// }
+/// # }
 /// ```
 #[derive(Clone)]
 pub struct Registrar {

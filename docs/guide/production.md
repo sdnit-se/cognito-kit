@@ -60,7 +60,9 @@ access tokens short-lived. An hour is Cognito's default.
 - Build the [`UserPool`](crate::UserPool), verifiers and
   [`OAuthFront`](crate::OAuthFront) once, before the runtime starts
   handling events. The key cache then survives between invocations of a
-  warm instance, and only a cold start fetches keys.
+  warm instance. A warm instance fetches keys only when the cache needs it:
+  for a key id it hasn't seen, at most once per cooldown, and once the keys
+  are ten minutes old.
 - A Lambda function URL renames the `WWW-Authenticate` header, so MCP
   clients don't see the challenge. They then look for the protected
   resource document at the root, and the front serves it there too.

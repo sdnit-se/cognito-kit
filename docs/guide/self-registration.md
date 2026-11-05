@@ -168,8 +168,12 @@ A pool holds 1,000 app clients by default, and AWS Support can raise that.
 The registrar stops at
 [`max_registrations`](crate::registration::RegistrarBuilder::max_registrations),
 500 by default, so the app clients you manage still fit. Past it, or when
-Cognito refuses at its own limit, new clients get a 503 with
-`temporarily_unavailable`. Registered clients keep working.
+Cognito refuses at its own limit, new clients get a 503. A client that
+registers through `/oauth2/register` gets it as a JSON OAuth error,
+`temporarily_unavailable`. One that arrives at `/oauth2/authorize` with a
+metadata document URL gets a plain-text page, since the front can't yet
+trust the redirect URI to send an error to. Registered clients keep
+working.
 
 Cognito allows five app-client changes per second per pool, shared with
 every other caller. Each server process makes at most ten a minute on

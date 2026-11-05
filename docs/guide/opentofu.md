@@ -75,12 +75,17 @@ a refresh.
 A client is public unless you set `confidential = true`. Use a confidential
 client for a server-side web app, and public ones for assistants.
 
-# Keep the Google secret out of your files
+# Keep the Google secret out of your configuration
 
 The module writes Google's client secret once, as a placeholder unless you
 pass `client_secret`, and never changes it afterwards. Set the real secret
-in the Cognito console or with the AWS CLI. It then never enters a file or
-a plan.
+in the Cognito console or with the AWS CLI, so it never enters a
+configuration file.
+
+It still reaches your state. OpenTofu reads the identity provider back on
+every refresh, and Cognito returns the secret with it, so the state and any
+saved plan hold it. Keep both where secrets may live: an encrypted backend
+with tight access, or OpenTofu's state encryption.
 
 # Wire the outputs to the crate
 

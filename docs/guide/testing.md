@@ -9,6 +9,18 @@ Turn it on for your tests only:
 cognito-kit = { version = "0.3", features = ["test-kit"] }
 ```
 
+The example below also uses the crate's `axum` feature for the extractor,
+and calls the router directly:
+
+```toml
+[dev-dependencies]
+cognito-kit = { version = "0.3", features = ["test-kit", "axum"] }
+axum = "0.8"
+http = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tower = { version = "0.5", features = ["util"] }
+```
+
 The fake's signing key is fixed and public, since it is in this crate's
 source. Only a [`UserPool`](crate::UserPool) from
 [`FakeCognito::pool`](crate::test_kit::FakeCognito::pool) trusts it, so the
