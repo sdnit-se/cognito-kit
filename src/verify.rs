@@ -234,6 +234,19 @@ impl Audience {
 }
 
 /// Settings for an [`AccessTokenVerifier`]; from [`UserPool::access_tokens`].
+///
+/// # Examples
+///
+/// ```
+/// use cognito_kit::{AccessTokenVerifier, ConfigError, UserPool};
+///
+/// fn verifier(pool: &UserPool) -> Result<AccessTokenVerifier, ConfigError> {
+///     pool.access_tokens()
+///         .clients(["1example23456789".parse()?, "2example23456789".parse()?])
+///         .scope("https://api.example.com/read".parse()?)
+///         .build()
+/// }
+/// ```
 #[must_use]
 pub struct AccessTokenVerifierBuilder {
     pool: UserPool,
@@ -314,8 +327,13 @@ impl AccessTokenVerifierBuilder {
         self
     }
 
-    /// Checks the settings: at least one client or a registrar, and an
-    /// https audience (or http on localhost).
+    /// The verifier, once the settings are checked.
+    ///
+    /// # Errors
+    ///
+    /// - [`ConfigError::NoClients`] without an app client or a registrar.
+    /// - [`ConfigError::Url`] if the audience or resource is neither https
+    ///   nor http on localhost, or has a fragment.
     pub fn build(self) -> Result<AccessTokenVerifier, ConfigError> {
         #[cfg(feature = "registration")]
         let registered = self.registrar.is_some();
@@ -342,6 +360,15 @@ impl AccessTokenVerifierBuilder {
 impl AccessTokenVerifier {
     /// Verifies an access token: its signature against the pool's keys, its
     /// issuer, expiry, kind, app client, audience and scopes.
+    ///
+    /// The first check fetches the pool's keys. A token signed with a key
+    /// the cache doesn't know triggers a refetch, at most once per
+    /// [cooldown](UserPool::refetch_cooldown).
+    ///
+    /// # Errors
+    ///
+    /// The [`Rejection`] for the first check that fails.
+    /// [`Rejection::status`] turns it into 401, 403 or 503.
     pub async fn verify<C: DeserializeOwned>(&self, token: &str) -> Result<AccessClaims<C>, Rejection> {
         let audience = self.audience.url().map(canonical);
         let claims = decode(&self.pool, token, "access", audience.as_deref(), self.leeway).await?;
@@ -362,6 +389,11 @@ impl AccessTokenVerifier {
     }
 
     /// Verifies the request's bearer token, or says how to refuse it.
+    ///
+    /// # Errors
+    ///
+    /// A [`Challenge`] to send back when the request has no bearer token,
+    /// or [`verify`](Self::verify) refuses it.
     pub async fn authenticate<C: DeserializeOwned>(
         &self,
         headers: &HeaderMap,
@@ -503,6 +535,10 @@ impl IdTokenVerifier {
 
     /// Verifies an ID token: its signature, issuer, expiry, kind, and that
     /// its `aud` is this verifier's app client.
+    ///
+    /// # Errors
+    ///
+    /// The [`Rejection`] for the first check that fails.
     pub async fn verify<C: DeserializeOwned>(&self, token: &str) -> Result<IdClaims<C>, Rejection> {
         typed(decode(&self.pool, token, "id", Some(self.client.as_str()), self.leeway).await?)
     }

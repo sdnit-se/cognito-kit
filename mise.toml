@@ -45,13 +45,20 @@ run = [
   "cargo test --no-default-features --features axum --lib --tests",
   "cargo test --no-default-features --features tower --lib --tests",
   "cargo test --no-default-features --features test-kit --lib --tests",
-  "cargo test --all-features",
+  # The doc task runs the doc examples with every feature.
+  "cargo test --all-features --all-targets",
 ]
 
 [tasks.doc]
-description = "Build the docs as docs.rs does, failing on warnings"
+description = "Build the docs as docs.rs does and with the default features, and run their examples, failing on warnings"
 env = { RUSTDOCFLAGS = "-D warnings" }
-run = "cargo doc --no-deps --all-features"
+run = [
+  "cargo doc --no-deps --all-features",
+  "cargo doc --no-deps",
+  "cargo test --doc --all-features",
+  # Examples that need a narrower feature than `registration` must say so.
+  "cargo test --doc --features registration",
+]
 
 [tasks.msrv]
 description = "Check that the crate builds on its minimum supported Rust, and the AWS SDK features on the SDK's"

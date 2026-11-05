@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Docs: a guide on docs.rs with a chapter for each job, a shorter README,
+  and `# Errors` and examples on the main types.
+
 ## 0.3.0 (2026-11-04)
 
 Assistants connect to an MCP server from its URL alone. They register

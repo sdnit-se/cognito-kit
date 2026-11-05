@@ -256,6 +256,37 @@ enum Removal {
 /// [`OAuthFront`](crate::OAuthFront) then serves its own authorize, token
 /// and revocation endpoints, and with Dynamic Client Registration on, a
 /// registration endpoint.
+///
+/// [The self-registration chapter](crate::guide::self_registration) covers
+/// the trust list, the loopback relay, limits and cleanup.
+///
+/// # Examples
+///
+/// With the `dynamodb` feature for the store:
+///
+/// ```
+/// # #[cfg(feature = "dynamodb")]
+/// # mod example {
+/// use cognito_kit::registration::{CognitoApi, DynamoStore, Registrar};
+///
+/// fn registrar(
+///     cognito: aws_sdk_cognitoidentityprovider::Client,
+///     dynamodb: aws_sdk_dynamodb::Client,
+/// ) -> Result<Registrar, Box<dyn std::error::Error>> {
+///     let pool = "eu-north-1_AbC123".parse()?;
+///     let template = "1example23456789".parse()?;
+///     let registrar = Registrar::builder(
+///         CognitoApi::new(cognito, pool, template),
+///         DynamoStore::new(dynamodb, "portal-registrations"),
+///     )
+///     .metadata_documents()
+///     .dynamic_registration()
+///     .client_hosts(["claude.ai", "chatgpt.com"])
+///     .build()?;
+///     Ok(registrar)
+/// }
+/// # }
+/// ```
 #[derive(Clone)]
 pub struct Registrar {
     inner: Arc<Inner>,
@@ -361,8 +392,13 @@ impl RegistrarBuilder {
         self
     }
 
-    /// Checks that something is accepted: documents, dynamic registration,
-    /// or both.
+    /// The registrar, once the settings are checked.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Registration`] if neither metadata documents nor
+    /// dynamic registration is on, or the name prefix is empty, longer than
+    /// 64 characters, or has a character Cognito refuses in a name.
     pub fn build(self) -> Result<Registrar, ConfigError> {
         if self.documents.is_none() && !self.dynamic {
             return Err(ConfigError::Registration(
@@ -765,6 +801,12 @@ impl Registrar {
     /// off `client_hosts`. Every registration is listed, and Cognito allows
     /// five app-client changes per second per pool, so a large cleanup
     /// takes a while.
+    ///
+    /// # Errors
+    ///
+    /// [`RegistrationError::Unavailable`] if the store or Cognito fails. The
+    /// removals made before the failure stand, and the next run picks up
+    /// the rest.
     pub async fn cleanup(&self) -> Result<Cleanup, RegistrationError> {
         let mut report = Cleanup::default();
         let now = now();

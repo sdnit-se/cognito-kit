@@ -16,6 +16,7 @@
 //! let claims: cognito_kit::AccessClaims = verifier.verify(&token).await?;
 //! assert_eq!(claims.client_id, client);
 //! # Ok(()) }
+//! # tokio::runtime::Runtime::new().unwrap().block_on(run()).unwrap();
 //! ```
 //!
 //! The signing key is fixed and public: it is in this crate's source. Only a
@@ -85,6 +86,29 @@ struct State {
 /// code under test, sign tokens with [`access_token`](Self::access_token)
 /// or [`sign`](Self::sign), and play a person signing in with
 /// [`sign_in`](Self::sign_in).
+///
+/// [The testing chapter](crate::guide::testing) has more examples.
+///
+/// # Examples
+///
+/// ```
+/// use cognito_kit::test_kit::FakeCognito;
+/// use cognito_kit::{AccessClaims, Rejection};
+///
+/// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+/// let cognito = FakeCognito::new();
+/// let api = cognito.add_client("api", &["https://app.example.com/callback"]);
+/// let other = cognito.add_client("other", &["https://other.example.com/callback"]);
+/// let verifier = cognito.pool().access_tokens().client(api.clone()).build()?;
+///
+/// let claims: AccessClaims = verifier.verify(&cognito.access_token(&api, None, "openid")).await?;
+/// assert_eq!(claims.client_id, api);
+///
+/// let refused = verifier.verify::<()>(&cognito.access_token(&other, None, "openid")).await;
+/// assert!(matches!(refused, Err(Rejection::Client)));
+/// # Ok(()) }
+/// # tokio::runtime::Runtime::new().unwrap().block_on(run()).unwrap();
+/// ```
 #[derive(Clone)]
 pub struct FakeCognito(Arc<State>);
 
@@ -195,6 +219,11 @@ impl FakeCognito {
     }
 
     /// Adds an app client, as you would with OpenTofu.
+    ///
+    /// # Panics
+    ///
+    /// If `callback_urls` is empty, or the pool is at the limit set with
+    /// [`limit_app_clients`](Self::limit_app_clients).
     pub fn add_client(&self, name: &str, callback_urls: &[&str]) -> ClientId {
         let urls: Vec<String> = callback_urls.iter().map(|u| (*u).to_owned()).collect();
         self.create_client(name, &urls)
@@ -250,6 +279,17 @@ impl FakeCognito {
     /// next: the client's redirect URI with a code and the state. Refuses as
     /// Cognito does: an unknown client, or a redirect URI that isn't one of
     /// the app client's callback URLs exactly.
+    ///
+    /// The ID token that the code later redeems for doesn't carry the
+    /// authorization request's nonce, so [`ManagedLogin::callback`](crate::ManagedLogin::callback)
+    /// refuses it.
+    ///
+    /// # Errors
+    ///
+    /// Cognito's error code, or a description, when `authorize` isn't this
+    /// pool's authorize endpoint, names an unknown app client, or has a
+    /// `redirect_uri`, `response_type` or `code_challenge_method` that
+    /// Cognito would refuse.
     pub fn sign_in(&self, authorize: &Url, sub: &str) -> Result<Url, String> {
         if authorize.origin() != self.0.login.url().origin() || authorize.path() != "/oauth2/authorize" {
             return Err(format!("{authorize} is not this pool's authorize endpoint"));
@@ -447,6 +487,21 @@ mod registration {
     /// A [`RegistrationStore`] in memory, for tests and single-process
     /// experiments. Its registrations are gone when the process ends, and
     /// their app clients stay behind.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cognito_kit::registration::Registrar;
+    /// use cognito_kit::test_kit::{FakeCognito, MemoryStore};
+    ///
+    /// let cognito = FakeCognito::new();
+    /// let store = MemoryStore::new();
+    /// let registrar = Registrar::builder(cognito.clone(), store.clone())
+    ///     .dynamic_registration()
+    ///     .build()?;
+    /// assert!(store.registrations().is_empty());
+    /// # Ok::<(), cognito_kit::ConfigError>(())
+    /// ```
     #[derive(Clone, Default)]
     pub struct MemoryStore(Arc<Mutex<BTreeMap<String, Registration>>>);
 

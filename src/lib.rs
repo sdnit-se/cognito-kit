@@ -1,184 +1,165 @@
-//! A Rust toolkit for Amazon Cognito.
+//! A Rust toolkit for Amazon Cognito: check its tokens, sign people in on the
+//! web, and let AI assistants sign in to your MCP server.
 //!
 //! Unofficial. Not affiliated with or endorsed by AWS.
 //!
-//! `cognito-kit` covers four jobs:
+//! Cognito is AWS's user directory and sign-in service. It issues JSON Web
+//! Tokens and hosts a sign-in page, managed login, for each user pool. The
+//! AWS SDK for Rust manages pools, but it doesn't check the tokens they
+//! issue or drive the sign-in, and Cognito's OAuth server lacks parts that
+//! MCP clients need. This crate fills those gaps:
 //!
-//! - **Token checks** for any service that Cognito protects. It verifies
-//!   access tokens and ID tokens against the user pool's published keys and
-//!   hands you typed claims.
-//! - **Web sign-in through managed login**: the login redirect with PKCE,
-//!   state and nonce, the callback exchange, refresh, revocation and the
-//!   logout URL.
-//! - **An OAuth front for MCP servers.** Cognito issues every token, and this
-//!   crate publishes the metadata that MCP clients need and Cognito lacks:
-//!   RFC 9728 protected resource metadata, RFC 8414 authorization server
-//!   metadata that advertises PKCE with `S256`, and `WWW-Authenticate`
-//!   challenges.
-//! - **Clients that register themselves** (feature `registration`): an
-//!   assistant's Client ID Metadata Document URL as its client id, or
-//!   Dynamic Client Registration, each mapped to an app client the
-//!   [`registration::Registrar`] creates. Assistants then connect from the
-//!   MCP server's URL alone.
+//! - **Token checks** for an API that Cognito protects: signature, issuer,
+//!   expiry, app client, audience and scopes, with typed claims.
+//! - **Web sign-in** through managed login, with PKCE, state and nonce.
+//! - **An OAuth front for MCP servers**, serving the metadata documents
+//!   that MCP clients look for and Cognito doesn't publish.
+//! - **Self-registration** for assistants such as Claude and Codex, so they
+//!   connect from your MCP server's URL alone.
+//! - **A fake Cognito** for your tests, and an OpenTofu module for the pool.
 //!
-//! The `test-kit` feature adds [`test_kit::FakeCognito`] for your own tests.
+//! The core uses only the [`http`] crate's types and works with any web
+//! framework, or none. It doesn't depend on an MCP SDK.
 //!
-//! The core uses only [`http`] types and works with any web framework or
-//! none. The `axum` and `tower` features add adapters. The crate is
-//! independent of any MCP SDK.
+//! # Quick start
 //!
-//! # The API at a glance
+//! Check an access token from the command line. Put in your pool's id and
+//! an app client's id, then run it with a token that the app client got:
 //!
-//! ```text
-//! // Identity
-//! PoolId: FromStr            "eu-north-1_AbC123"; the region comes from the id
-//! ClientId: FromStr          an app client id
-//! Scope: FromStr             an OAuth scope, such as "https://api.example.com/read"
-//! LoginDomain: FromStr       the managed login origin, "https://login.example.com"
-//!
-//! // The pool and its keys
-//! UserPool::new(PoolId) -> UserPool                                  (feature `reqwest`)
-//! UserPool::with_http_client(PoolId, impl HttpClient) -> UserPool
-//! UserPool::refetch_cooldown(self, Duration) -> UserPool
-//! UserPool::max_key_age(self, Duration) -> UserPool
-//! UserPool::issuer(&self) -> &str
-//!
-//! // Access tokens
-//! UserPool::access_tokens(&self) -> AccessTokenVerifierBuilder
-//!     .client(ClientId) / .clients(impl IntoIterator<Item = ClientId>)  at least one
-//!     .scope(Scope)                                                     required on every token
-//!     .audience(Url)                                                    `aud` must equal it
-//!     .resource(Url)                                                    as `audience`, and challenges point at its metadata
-//!     .leeway(Duration)
-//!     .build() -> Result<AccessTokenVerifier, ConfigError>
-//! AccessTokenVerifier::verify::<C>(&self, &str) -> Result<AccessClaims<C>, Rejection>
-//! AccessTokenVerifier::authenticate::<C>(&self, &HeaderMap) -> Result<AccessClaims<C>, Challenge>
-//! AccessTokenVerifier::challenge(&self, Rejection) -> Challenge
-//!
-//! // ID tokens
-//! UserPool::id_tokens(&self, ClientId) -> IdTokenVerifier
-//! IdTokenVerifier::verify::<C>(&self, &str) -> Result<IdClaims<C>, Rejection>
-//!
-//! // Claims; C carries custom attributes through serde's flatten
-//! AccessClaims<C = ()> { sub, client_id, username, groups, scopes, exp, iat, auth_time, jti, custom: C }
-//! IdClaims<C = ()>     { sub, username, email, email_verified, name, groups, identities, exp, iat, auth_time, custom: C }
-//! Rejection            Missing | Malformed | Algorithm | UnknownKey | Signature | Expired | Issuer
-//!                      | TokenUse | Audience | Client | Scope(Scope) | KeysUnavailable(..)
-//! Rejection::status(&self) -> StatusCode    401, 403 for a missing scope, 503 when keys can't be fetched
-//! Challenge::response(self) -> http::Response<String>
-//!
-//! // Web sign-in through managed login
-//! UserPool::managed_login(&self, LoginDomain, ClientId, Url) -> ManagedLoginBuilder
-//!     .client_secret(ClientSecret) .scopes(..) .build() -> Result<ManagedLogin, ConfigError>
-//! ManagedLogin::authorize(&self, &AuthorizeOptions) -> (Url, PendingLogin)
-//! ManagedLogin::callback::<C>(&self, PendingLogin, query: &str) -> Result<SignedIn<C>, LoginError>
-//! ManagedLogin::refresh::<C>(&self, &RefreshToken) -> Result<SignedIn<C>, LoginError>
-//! ManagedLogin::revoke(&self, &RefreshToken) -> Result<(), LoginError>
-//! ManagedLogin::logout_url(&self, &Url) -> Url
-//! SignedIn<C> { claims: IdClaims<C>, tokens: Tokens }
-//! Tokens { id_token: IdToken, access_token: AccessToken, refresh_token: Option<RefreshToken>, expires_in: Duration }
-//!
-//! // The OAuth front for MCP servers
-//! OAuthFront::new(AccessTokenVerifier, LoginDomain) -> Result<OAuthFront, ConfigError>
-//! OAuthFront::respond(&self, &Method, path: &str) -> Option<http::Response<String>>
-//! OAuthFront::paths(&self) -> impl Iterator<Item = &str>
-//! OAuthFront::protected_resource_metadata(&self) -> &ProtectedResourceMetadata
-//! OAuthFront::authorization_server_metadata(&self) -> &AuthorizationServerMetadata
-//! OAuthFront::verifier(&self) -> &AccessTokenVerifier
-//!
-//! // Adapters
-//! AccessClaims<C>: axum::extract::FromRequestParts<S> where AccessTokenVerifier: FromRef<S>   (feature `axum`)
-//! OAuthFront::router<S>(&self) -> axum::Router<S>                                             (feature `axum`)
-//! RequireBearerLayer::<C>::new(AccessTokenVerifier)                                          (feature `tower`)
-//!
-//! // Clients that register themselves (feature `registration`)
-//! OAuthFront::handle(&self, &http::Request<impl AsRef<[u8]>>) -> Option<http::Response<String>>
-//! AccessTokenVerifierBuilder::registrar(self, Registrar)       accepts the registrar's app clients
-//! Registrar::builder(impl AppClients, impl RegistrationStore) -> RegistrarBuilder
-//!     .metadata_documents() / .fetcher(impl FetchDocument)    a URL as client_id
-//!     .dynamic_registration()                                 RFC 7591 at /oauth2/register
-//!     .client_hosts(..)                                       https hosts trusted with codes
-//!     .max_registrations(usize) .unused_after(Duration) .idle_after(Duration) .name_prefix(..)
-//!     .build() -> Result<Registrar, ConfigError>
-//! Registrar::cleanup(&self) -> Result<Cleanup, RegistrationError>
-//! CognitoApi::new(aws_sdk_cognitoidentityprovider::Client, PoolId, template: ClientId)
-//! DynamoStore::new(aws_sdk_dynamodb::Client, table)                              (feature `dynamodb`)
-//! GuardedFetcher::new()                                        https, 5 KiB, 5 s, public addresses only
-//!
-//! // Tests (feature `test-kit`)
-//! FakeCognito::new() .pool() .login_domain() .add_client(..) .access_token(..) .sign(..) .sign_in(..)
-//! MemoryStore::new()                                                        (with `registration`)
+//! ```sh
+//! cargo add cognito-kit
+//! cargo add tokio --features macros,rt-multi-thread
 //! ```
 //!
-//! Every token check runs before your code sees a claim, so a value of
-//! [`AccessClaims`] or [`IdClaims`] always comes from a verified token. The
-//! two are distinct types, and each verifier refuses the other kind of token.
-//!
-//! # Checking access tokens
-//!
 //! ```no_run
-//! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 //! use cognito_kit::{AccessClaims, UserPool};
 //!
-//! let pool = UserPool::new("eu-north-1_AbC123".parse()?);
-//! let verifier = pool
-//!     .access_tokens()
-//!     .client("1example23456789".parse()?)
-//!     .scope("https://api.example.com/read".parse()?)
-//!     .build()?;
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let pool = UserPool::new("eu-north-1_AbC123".parse()?);
+//!     let verifier = pool
+//!         .access_tokens()
+//!         .client("1example23456789".parse()?)
+//!         .build()?;
 //!
-//! # let token = "";
-//! let claims: AccessClaims = verifier.verify(token).await?;
-//! println!("{} via {}", claims.sub, claims.client_id);
-//! # Ok(()) }
-//! ```
-//!
-//! [`AccessTokenVerifier::verify`] fetches the pool's keys on first use and
-//! caches them. A token signed with a key it hasn't seen triggers one refetch,
-//! at most once per cooldown (30 seconds by default), so a stream of forged
-//! key ids can't turn the service into a JWKS fetcher. Keys older than ten
-//! minutes are refetched on the next check, so a key that Cognito withdraws
-//! stops working. Until a refetch succeeds, stale keys aren't used, and
-//! checks fail with 503.
-//!
-//! # Custom attributes
-//!
-//! ```
-//! #[derive(serde::Deserialize)]
-//! struct Attributes {
-//!     #[serde(rename = "custom:tenant")]
-//!     tenant: Option<String>,
+//!     let token = std::env::args().nth(1).ok_or("pass an access token")?;
+//!     let claims: AccessClaims = verifier.verify(&token).await?;
+//!     println!("{} called through app client {}", claims.sub, claims.client_id);
+//!     Ok(())
 //! }
-//! type Claims = cognito_kit::IdClaims<Attributes>;
 //! ```
 //!
-//! # An MCP server
+//! To get a token to try it with, use the client credentials grant. It needs
+//! an app client with a secret, that grant turned on, and a scope from a
+//! resource server. Ask your managed login domain's token endpoint:
 //!
-//! ```no_run
-//! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-//! use cognito_kit::{OAuthFront, UserPool};
-//!
-//! let pool = UserPool::new("eu-north-1_AbC123".parse()?);
-//! let verifier = pool
-//!     .access_tokens()
-//!     .clients(["1claude".parse()?, "2chatgpt".parse()?])
-//!     .resource("https://portal.example.com/mcp".parse()?)
-//!     .scope("https://portal.example.com/mcp/drafts".parse()?)
-//!     .build()?;
-//! let front = OAuthFront::new(verifier, "https://login.example.com".parse()?)?;
-//!
-//! # let request = http::Request::new(());
-//! // In the request handler: serve the metadata documents, then check the token.
-//! if let Some(response) = front.respond(request.method(), request.uri().path()) {
-//!     // return response
-//! }
-//! match front.verifier().authenticate::<()>(request.headers()).await {
-//!     Ok(claims) => { /* handle the MCP request */ }
-//!     Err(challenge) => { /* return challenge.response() */ }
-//! }
-//! # Ok(()) }
+//! ```sh
+//! TOKEN=$(curl -s -u "$CLIENT_ID:$CLIENT_SECRET" \
+//!   -d grant_type=client_credentials -d scope=https://api.example.com/read \
+//!   https://login.example.com/oauth2/token | jq -r .access_token)
+//! cargo run -- "$TOKEN"
 //! ```
-
+//!
+//! It prints the token's subject and app client. For this grant, both are the
+//! app client's id.
+//!
+//! [`verify`](AccessTokenVerifier::verify) fetches the pool's keys on first
+//! use and caches them. In a web service, build the verifier once and use
+//! [`authenticate`](AccessTokenVerifier::authenticate), which reads the
+//! `Authorization` header. A refused request gets a ready response: 401 or
+//! 403 with a `WWW-Authenticate` challenge, or 503 when the pool's keys
+//! can't be fetched.
+//!
+//! # Which type you want
+//!
+//! | To | Start with |
+//! |----|------------|
+//! | Check access tokens in an API | [`UserPool::access_tokens`], which builds an [`AccessTokenVerifier`] |
+//! | Check ID tokens | [`UserPool::id_tokens`], which returns an [`IdTokenVerifier`] |
+//! | Read custom attributes | The type parameter of [`AccessClaims`] and [`IdClaims`] |
+//! | Sign people in on a website | [`UserPool::managed_login`], which builds a [`ManagedLogin`] |
+//! | Put an MCP server behind Cognito | [`OAuthFront`] |
+//! | Let assistants register themselves | [`Registrar`] |
+//! | Test without AWS | [`FakeCognito`] |
+//! | Use your own HTTP client | [`HttpClient`] and [`UserPool::with_http_client`] |
+//!
+//! # Features
+//!
+//! | Feature | Default | Adds |
+//! |---------|---------|------|
+//! | `reqwest` | yes | [`UserPool::new`], with a reqwest client over rustls and the system's root certificates |
+//! | `axum` | no | [`AccessClaims`] as an axum extractor, and [`OAuthFront::router`] |
+//! | `tower` | no | [`RequireBearerLayer`], which admits only requests with a valid token |
+//! | `registration` | no | The [`registration`] module, with [`CognitoApi`] over the AWS SDK. Turns on `reqwest` |
+//! | `dynamodb` | no | [`DynamoStore`], which keeps registrations in DynamoDB. Turns on `registration` |
+//! | `test-kit` | no | The [`test_kit`] module: [`FakeCognito`], and with `registration`, [`MemoryStore`] |
+//!
+//! The crate builds on Rust 1.88. `registration` and `dynamodb` need the AWS
+//! SDK's minimum, Rust 1.94.1 for the versions this release was tested with.
+//!
+//! # Guide
+//!
+//! The [`guide`] walks through each job:
+//!
+//! 1. [Checking access tokens](guide::access_tokens), with custom
+//!    attributes, the axum extractor and the tower layer.
+//! 2. [Web sign-in with managed login](guide::web_sign_in).
+//! 3. [An MCP server behind Cognito](guide::mcp_server).
+//! 4. [Letting assistants register themselves](guide::self_registration).
+//! 5. [Testing with the test kit](guide::testing).
+//! 6. [The OpenTofu module](guide::opentofu).
+//! 7. [Production notes](guide::production): key caching, status codes,
+//!    Lambda, and the security model.
+//!
+// Items behind a feature: in a build without it, their links go to docs.rs.
+#![cfg_attr(feature = "tower", doc = "[`RequireBearerLayer`]: RequireBearerLayer")]
+#![cfg_attr(
+    not(feature = "tower"),
+    doc = "[`RequireBearerLayer`]: https://docs.rs/cognito-kit/latest/cognito_kit/struct.RequireBearerLayer.html"
+)]
+#![cfg_attr(feature = "axum", doc = "[`OAuthFront::router`]: OAuthFront::router")]
+#![cfg_attr(
+    not(feature = "axum"),
+    doc = "[`OAuthFront::router`]: https://docs.rs/cognito-kit/latest/cognito_kit/struct.OAuthFront.html#method.router"
+)]
+#![cfg_attr(feature = "registration", doc = "[`registration`]: registration")]
+#![cfg_attr(
+    not(feature = "registration"),
+    doc = "[`registration`]: https://docs.rs/cognito-kit/latest/cognito_kit/registration/index.html"
+)]
+#![cfg_attr(feature = "registration", doc = "[`Registrar`]: registration::Registrar")]
+#![cfg_attr(
+    not(feature = "registration"),
+    doc = "[`Registrar`]: https://docs.rs/cognito-kit/latest/cognito_kit/registration/struct.Registrar.html"
+)]
+#![cfg_attr(feature = "registration", doc = "[`CognitoApi`]: registration::CognitoApi")]
+#![cfg_attr(
+    not(feature = "registration"),
+    doc = "[`CognitoApi`]: https://docs.rs/cognito-kit/latest/cognito_kit/registration/struct.CognitoApi.html"
+)]
+#![cfg_attr(feature = "dynamodb", doc = "[`DynamoStore`]: registration::DynamoStore")]
+#![cfg_attr(
+    not(feature = "dynamodb"),
+    doc = "[`DynamoStore`]: https://docs.rs/cognito-kit/latest/cognito_kit/registration/struct.DynamoStore.html"
+)]
+#![cfg_attr(feature = "test-kit", doc = "[`test_kit`]: test_kit")]
+#![cfg_attr(
+    not(feature = "test-kit"),
+    doc = "[`test_kit`]: https://docs.rs/cognito-kit/latest/cognito_kit/test_kit/index.html"
+)]
+#![cfg_attr(feature = "test-kit", doc = "[`FakeCognito`]: test_kit::FakeCognito")]
+#![cfg_attr(
+    not(feature = "test-kit"),
+    doc = "[`FakeCognito`]: https://docs.rs/cognito-kit/latest/cognito_kit/test_kit/struct.FakeCognito.html"
+)]
+#![cfg_attr(
+    all(feature = "test-kit", feature = "registration"),
+    doc = "[`MemoryStore`]: test_kit::MemoryStore"
+)]
+#![cfg_attr(
+    not(all(feature = "test-kit", feature = "registration")),
+    doc = "[`MemoryStore`]: https://docs.rs/cognito-kit/latest/cognito_kit/test_kit/struct.MemoryStore.html"
+)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 mod claims;
@@ -192,6 +173,8 @@ mod verify;
 
 #[cfg(feature = "axum")]
 mod axum;
+#[cfg(any(doc, doctest))]
+pub mod guide;
 #[cfg(feature = "registration")]
 #[cfg_attr(docsrs, doc(cfg(feature = "registration")))]
 pub mod registration;
