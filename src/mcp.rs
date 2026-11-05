@@ -61,13 +61,31 @@ pub struct AuthorizationServerMetadata {
 
 /// What an MCP server needs in front of Cognito so that MCP clients can
 /// sign in: the two metadata documents, and the verifier whose challenges
-/// point at them. Clients use app clients you create, or with a
-/// [`Registrar`](crate::registration::Registrar) on the verifier, register
-/// themselves through the front's own endpoints.
+/// point at them.
 ///
-/// The authorization server's issuer is the resource's origin, so the
-/// documents and the MCP endpoint share a host. Cognito still authorizes,
-/// issues and refreshes every token.
+/// Clients use app clients you create. With a registrar on the verifier,
+/// they [register themselves](crate::guide::self_registration) through the
+/// front's own endpoints instead. The authorization server's issuer is the
+/// resource's origin, so the documents and the MCP endpoint share a host.
+/// Cognito still authorizes, issues and refreshes every token.
+///
+/// [The MCP chapter](crate::guide::mcp_server) shows the whole setup.
+///
+/// # Examples
+///
+/// ```
+/// use cognito_kit::{OAuthFront, UserPool};
+///
+/// fn front(pool: &UserPool) -> Result<OAuthFront, Box<dyn std::error::Error>> {
+///     let verifier = pool
+///         .access_tokens()
+///         .client("1example23456789".parse()?)
+///         .resource("https://portal.example.com/mcp".parse()?)
+///         .scope("https://portal.example.com/mcp/drafts".parse()?)
+///         .build()?;
+///     Ok(OAuthFront::new(verifier, "https://login.example.com".parse()?)?)
+/// }
+/// ```
 #[derive(Clone)]
 pub struct OAuthFront {
     verifier: AccessTokenVerifier,
@@ -83,13 +101,19 @@ fn strings<'a>(items: impl IntoIterator<Item = &'a str>) -> Vec<String> {
 }
 
 impl OAuthFront {
-    /// `verifier` must be built with
-    /// [`resource`](crate::AccessTokenVerifierBuilder::resource). When it
-    /// has a [`registrar`](crate::AccessTokenVerifierBuilder::registrar),
-    /// the front also serves `/oauth2/authorize`, `/oauth2/token`,
-    /// `/oauth2/revoke`, `/oauth2/callback` and, with Dynamic Client
-    /// Registration, `/oauth2/register`, and the metadata points at them;
-    /// serve them with [`handle`](Self::handle).
+    /// A front for `verifier`'s resource, whose people sign in through
+    /// managed login at `login`.
+    ///
+    /// When the verifier has a registrar, the front also serves
+    /// `/oauth2/authorize`, `/oauth2/token`, `/oauth2/revoke`,
+    /// `/oauth2/callback` and, with Dynamic Client Registration,
+    /// `/oauth2/register`, and the metadata points at them. Serve them with
+    /// [`handle`](Self::handle).
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::NoResource`] if `verifier` wasn't built with
+    /// [`resource`](crate::AccessTokenVerifierBuilder::resource).
     pub fn new(verifier: AccessTokenVerifier, login: LoginDomain) -> Result<Self, ConfigError> {
         let resource = verifier.resource().ok_or(ConfigError::NoResource)?;
         let issuer = resource.origin().ascii_serialization();

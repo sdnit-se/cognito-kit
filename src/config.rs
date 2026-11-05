@@ -44,6 +44,14 @@ fn url_error(url: &str, reason: &'static str) -> ConfigError {
 }
 
 /// A user pool id, such as `eu-north-1_AbC123`. Its prefix is the region.
+///
+/// Parse it from a string. Anything else is a [`ConfigError::PoolId`].
+///
+/// ```
+/// let id: cognito_kit::PoolId = "eu-north-1_AbC123".parse()?;
+/// assert_eq!(id.region(), "eu-north-1");
+/// # Ok::<(), cognito_kit::ConfigError>(())
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PoolId(String);
 
@@ -90,7 +98,10 @@ impl fmt::Display for PoolId {
     }
 }
 
-/// An app client id.
+/// An app client id, such as `1example23456789`.
+///
+/// Parse it from a string: 1 to 128 letters, digits, `_` or `+`. Anything
+/// else is a [`ConfigError::ClientId`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ClientId(String);
@@ -131,6 +142,9 @@ impl PartialEq<str> for ClientId {
 
 /// An OAuth scope: a standard one such as `openid`, or a resource server's,
 /// such as `https://api.example.com/read`.
+///
+/// Parse it from a string. One with a space, `"` or `\`, or an empty one,
+/// is a [`ConfigError::Scope`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Scope(String);
@@ -169,6 +183,9 @@ impl fmt::Display for Scope {
 /// The origin that serves managed login: a custom domain such as
 /// `https://login.example.com`, or a prefix domain such as
 /// `https://example.auth.eu-north-1.amazoncognito.com`.
+///
+/// Parse it from a string. A URL that isn't https, or that has a path or
+/// query, is a [`ConfigError::Url`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoginDomain(Url);
 
