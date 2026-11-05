@@ -2,7 +2,8 @@
 // Code's metadata document and its Dynamic Client Registration, scripted as
 // Claude Code does them, then the real Codex CLI by document and by
 // registration. Prints what it saw as JSON and never prints a token or the
-// password.
+// password, then fails on each outcome that outcomes.ts expects and a flow
+// missed.
 //
 //   BASE=http://localhost:3000 USER_FILE=<json with email, password> \
 //   PLAYWRIGHT=<path to playwright's index.mjs> [CODEX=codex] bun tests/live/registration.ts
@@ -10,6 +11,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { mkdtempSync, readFileSync, writeFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { check } from './outcomes.ts';
 
 const { chromium } = await import(process.env.PLAYWRIGHT ?? 'playwright');
 const BASE = process.env.BASE!;
@@ -229,4 +231,4 @@ try {
   await browser.close();
 }
 console.log(JSON.stringify(report, null, 2));
-if (JSON.stringify(report).includes('"failure"')) process.exitCode = 1;
+check(report);
