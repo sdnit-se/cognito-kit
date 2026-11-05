@@ -51,6 +51,9 @@ const MIN_REFETCH: Duration = Duration::from_secs(60);
 /// App-client writes that requests may cause per minute, per process.
 /// Cognito allows five per second per pool for every caller together.
 const WRITES_PER_MINUTE: usize = 10;
+/// The most callback writes one refresh makes while other refreshes keep
+/// changing the store.
+const ROUNDS: usize = 4;
 /// How long a check against Cognito or the store is reused.
 const KNOWN_FOR: Duration = Duration::from_secs(60);
 const TOUCH_EVERY: Duration = Duration::from_secs(3600);
@@ -620,13 +623,44 @@ impl Registrar {
         };
         let metadata = document::parse(url, &body).map_err(RegistrationError::InvalidClient)?;
         let metadata = self.trusted_uris(metadata)?;
-        let Some(mut registration) = stored else {
+        let Some(stored) = stored else {
             return self.create_document(url, metadata, relay).await;
         };
-        registration.redirect_uris = metadata.redirect_uris;
-        registration.client_name = metadata.client_name;
-        registration.fetched_at = now;
-        self.write()?;
+        // A refresh that writes the store succeeds only once it has seen
+        // Cognito hold what the store holds. Any other end leaves the
+        // document due, so the next sign-in refreshes it and repairs what
+        // this one left apart.
+        if let Err(busy) = self.write() {
+            return if stored.redirect_uris == metadata.redirect_uris {
+                Ok(stored)
+            } else {
+                Err(busy)
+            };
+        }
+        let registration = Registration {
+            redirect_uris: metadata.redirect_uris,
+            client_name: metadata.client_name,
+            fetched_at: now,
+            ..stored
+        };
+        let refreshed = self.refresh(url, registration, relay).await;
+        if refreshed.is_err()
+            && let Ok(Some(mut due)) = self.inner.store.get(url.as_str()).await
+        {
+            due.fetched_at = 0;
+            let _ = self.inner.store.update(&due).await;
+        }
+        refreshed
+    }
+
+    /// Stores a refreshed document, then gives its app client what the
+    /// store holds.
+    async fn refresh(
+        &self,
+        url: &DocumentUrl,
+        mut registration: Registration,
+        relay: &str,
+    ) -> Result<Registration, RegistrationError> {
         self.inner
             .store
             .update(&registration)
@@ -635,7 +669,7 @@ impl Registrar {
         // Concurrent refreshes interleave their writes. Each one writes
         // Cognito after the store, then reads the store again until it
         // holds what Cognito got, so the last Cognito write is the store's.
-        loop {
+        for _ in 0..ROUNDS {
             let urls = callbacks(&registration.redirect_uris, relay);
             self.inner
                 .app_clients
@@ -649,9 +683,10 @@ impl Registrar {
                     self.write()?;
                     registration = stored;
                 }
-                _ => return Ok(registration),
+                stored => return Ok(stored.unwrap_or(registration)),
             }
         }
+        Err(RegistrationError::Busy)
     }
 
     /// Keeps the redirect URIs a code may be sent to, and refuses a

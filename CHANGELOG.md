@@ -8,12 +8,17 @@
   the store holding the new one, so sign-ins with the new URIs got
   `redirect_mismatch` until the document changed again (#6). A refresh now
   writes the store first, then gives the app client what the store holds,
-  and reads the store again until the two agree. The next refresh also
-  repairs one that stopped between the two writes.
-- Every document refresh now updates its app client, so each one counts
-  against the ten app-client writes a minute that requests may cause per
-  process. A document is fetched again after five minutes, or after one
-  for a redirect URI it doesn't list.
+  and reads the store again until the two agree. A refresh that fails
+  after its store write, such as one Cognito throttles, marks the document
+  due, so the next sign-in refreshes it and repairs the app client. If
+  that mark fails too, or a server stops between the two writes, they stay
+  apart until the document is due anyway, at most five minutes later.
+- A document refresh now updates its app client even when the document
+  is unchanged, and counts against the ten app-client writes a minute that
+  requests may cause per process. When they are spent, an unchanged
+  document is used as stored and stays due, and a changed one gets 503
+  `temporarily_unavailable`, as before. A document is fetched again after
+  five minutes, or after one for a redirect URI it doesn't list.
 
 ## 0.3.0 (2026-11-04)
 
