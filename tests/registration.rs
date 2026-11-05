@@ -69,12 +69,21 @@ fn registration(redirect_uris: &[&str]) -> serde_json::Value {
 
 const REGISTER: &str = "https://portal.example.com/oauth2/register";
 
-/// Spends `writes` of a server's app-client writes for the minute.
-async fn spend(front: &OAuthFront, writes: usize) {
-    for _ in 0..writes {
+/// Spends the rest of a server's app-client writes for the minute.
+async fn spend(front: &OAuthFront) {
+    loop {
         let answer = post_json(front, REGISTER, &registration(&["http://127.0.0.1:9000/cb"])).await;
-        assert_eq!(answer.status(), StatusCode::CREATED);
+        if answer.status() != StatusCode::CREATED {
+            assert_eq!(answer.status(), StatusCode::SERVICE_UNAVAILABLE);
+            return;
+        }
     }
+}
+
+/// Whether a sign-in finished, or got 503 so that the client tries again,
+/// rather than reaching Cognito with a callback it lacks.
+fn signed_in_or_retry(signed_in: &Result<serde_json::Value, String>) -> bool {
+    signed_in.is_ok() || signed_in.as_ref().is_err_and(|e| e.starts_with("503"))
 }
 
 #[tokio::test]
@@ -773,7 +782,7 @@ async fn a_new_redirect_uri_works_after_refreshes_that_overtake_each_other() {
         release.notify_one();
     };
     finish(async { tokio::join!(refresh(), refresh()) }).await;
-    let signed_in = sign_in(&server, &claude(new)).await;
+    let signed_in = finish(sign_in(&server, &claude(new))).await;
     assert!(signed_in.is_ok(), "{signed_in:?}");
 }
 
@@ -793,17 +802,38 @@ async fn a_document_due_for_a_refresh_signs_in_while_app_client_writes_are_spent
         .await
         .unwrap();
     server.store.edit(CLAUDE, |r| r.fetched_at -= 600);
-    spend(&server.front, 9).await;
+    spend(&server.front).await;
     let signed_in = sign_in(&server, &claude(CLAUDE_CALLBACK)).await;
     assert!(signed_in.is_ok(), "{signed_in:?}");
+    let fetches = server.documents.fetches();
+    sign_in(&server, &claude(CLAUDE_CALLBACK)).await.unwrap();
+    assert_eq!(
+        server.documents.fetches(),
+        fetches,
+        "fetched at most once a minute while the writes are spent"
+    );
 
-    // Another server, with writes to spare, refreshes the document.
-    let registrar = Registrar::builder(server.cognito.clone(), server.store.clone())
+    // Another server, with writes to spare, refreshes the document, and
+    // Cognito throttles its first write.
+    let cognito = FaultyCognito {
+        cognito: server.cognito.clone(),
+        fails: Arc::new(AtomicBool::new(true)),
+        ..FaultyCognito::default()
+    };
+    let registrar = Registrar::builder(cognito, server.store.clone())
         .fetcher(server.documents.clone())
         .client_hosts(["claude.ai"])
         .build()
         .unwrap();
-    let other = serve(server.cognito, server.store, server.documents, registrar);
+    let other = serve(
+        server.cognito.clone(),
+        server.store.clone(),
+        server.documents.clone(),
+        registrar,
+    );
+    let _ = sign_in(&other, &claude(added)).await;
+    let on_spent = sign_in(&server, &claude(added)).await;
+    assert!(signed_in_or_retry(&on_spent), "{on_spent:?}");
     let signed_in = sign_in(&other, &claude(added)).await;
     assert!(signed_in.is_ok(), "{signed_in:?}");
 }
@@ -845,8 +875,8 @@ async fn a_sign_in_repairs_a_refresh_that_ran_out_of_writes_partway() {
     let new = "https://claude.ai/api/mcp/auth_callback/3";
     // Two servers share the pool and the store, and their fetches of
     // Claude's document cross: A gets the old one, B the new. A stores the
-    // old one with its last app-client write of the minute, B stores the new
-    // one and finishes, and then A's Cognito write lands.
+    // old one, B stores the new one and finishes, A's other app-client writes
+    // of the minute are spent, and then A's Cognito write lands.
     let fake = FakeCognito::new();
     let store = MemoryStore::new();
     let faulty = Faulty {
@@ -886,14 +916,122 @@ async fn a_sign_in_repairs_a_refresh_that_ran_out_of_writes_partway() {
     sign_in(&b, &claude(CLAUDE_CALLBACK)).await.unwrap();
     b.documents.serve(CLAUDE, &claude_document(&[new]));
     b.store.edit(CLAUDE, |r| r.fetched_at -= 600);
-    spend(&a.front, 9).await;
 
     let url = authorize_url(CLAUDE, new, true);
     let refresh_b = async {
         get(&b.front, &url).await;
+        spend(&a.front).await;
         release.notify_one();
     };
     finish(async { tokio::join!(get(&a.front, &url), refresh_b) }).await;
-    let signed_in = sign_in(&b, &claude(new)).await;
+    // Claude's document settles on the new callback.
+    a.documents.serve(CLAUDE, &claude_document(&[new]));
+    let on_a = finish(sign_in(&a, &claude(new))).await;
+    assert!(signed_in_or_retry(&on_a), "{on_a:?}");
+    let signed_in = finish(sign_in(&b, &claude(new))).await;
     assert!(signed_in.is_ok(), "{signed_in:?}");
+}
+
+/// Fetches from `documents`, with faults: the next fetch times out while
+/// `fails` is set, and one fetch made while `holds` is set notifies `held`
+/// and waits until `release` is notified.
+#[derive(Clone, Default)]
+struct FaultyFetch {
+    documents: Documents,
+    fails: Arc<AtomicBool>,
+    holds: Arc<AtomicBool>,
+    held: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+impl FetchDocument for FaultyFetch {
+    fn fetch<'a>(&'a self, url: &'a Url) -> BoxFuture<'a, Result<Vec<u8>, FetchError>> {
+        if self.fails.swap(false, Ordering::SeqCst) {
+            return Box::pin(async { Err(FetchError::Timeout) });
+        }
+        let holds = self.holds.swap(false, Ordering::SeqCst);
+        let fetched = self.documents.fetch(url);
+        Box::pin(async move {
+            if holds {
+                self.held.notify_one();
+                self.release.notified().await;
+            }
+            fetched.await
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_sign_in_while_writes_are_spent_uses_the_app_client_registered_meanwhile() {
+    // A sign-in on A reads Claude's registration and fetches its unchanged
+    // document. Meanwhile cleanup removes the registration and its app
+    // client, and a sign-in on B registers the document again.
+    let fake = FakeCognito::new();
+    let store = MemoryStore::new();
+    let fetcher = FaultyFetch::default();
+    fetcher
+        .documents
+        .serve(CLAUDE, &claude_document(&[CLAUDE_CALLBACK]));
+    let registrar = Registrar::builder(fake.clone(), store.clone())
+        .fetcher(fetcher.clone())
+        .dynamic_registration()
+        .client_hosts(["claude.ai"])
+        .build()
+        .unwrap();
+    let a = serve(fake.clone(), store.clone(), fetcher.documents.clone(), registrar);
+    let registrar = Registrar::builder(fake.clone(), store.clone())
+        .fetcher(fetcher.documents.clone())
+        .client_hosts(["claude.ai"])
+        .build()
+        .unwrap();
+    let b = serve(fake, store, fetcher.documents.clone(), registrar);
+    sign_in(&a, &claude(CLAUDE_CALLBACK)).await.unwrap();
+    a.store.edit(CLAUDE, |r| {
+        r.fetched_at -= 600;
+        r.last_used = Some(r.created_at - 40 * 24 * 3600);
+    });
+    spend(&a.front).await;
+
+    fetcher.holds.store(true, Ordering::SeqCst);
+    let register_again = async {
+        fetcher.held.notified().await;
+        assert_eq!(a.registrar.cleanup().await.unwrap().idle, 1);
+        sign_in(&b, &claude(CLAUDE_CALLBACK)).await.unwrap();
+        fetcher.release.notify_one();
+    };
+    let auth = claude(CLAUDE_CALLBACK);
+    let (on_a, ()) = finish(async { tokio::join!(sign_in(&a, &auth), register_again) }).await;
+    assert!(signed_in_or_retry(&on_a), "{on_a:?}");
+}
+
+#[tokio::test]
+async fn a_sign_in_repairs_a_failed_refresh_while_the_document_host_is_down() {
+    let new = "https://claude.ai/api/mcp/auth_callback/2";
+    let fake = FakeCognito::new();
+    let store = MemoryStore::new();
+    let fetcher = FaultyFetch::default();
+    let cognito = FaultyCognito {
+        cognito: fake.clone(),
+        ..FaultyCognito::default()
+    };
+    let write_fails = cognito.fails.clone();
+    let registrar = Registrar::builder(cognito, store.clone())
+        .fetcher(fetcher.clone())
+        .client_hosts(["claude.ai"])
+        .build()
+        .unwrap();
+    let server = serve(fake, store, fetcher.documents.clone(), registrar);
+    server
+        .documents
+        .serve(CLAUDE, &claude_document(&[CLAUDE_CALLBACK]));
+    sign_in(&server, &claude(CLAUDE_CALLBACK)).await.unwrap();
+    // Claude moves its callback, Cognito throttles the refresh's write, and
+    // then Claude's host stops answering.
+    server.documents.serve(CLAUDE, &claude_document(&[new]));
+    server.store.edit(CLAUDE, |r| r.fetched_at -= 120);
+    write_fails.store(true, Ordering::SeqCst);
+    let _ = sign_in(&server, &claude(new)).await;
+    fetcher.fails.store(true, Ordering::SeqCst);
+    let retried = sign_in(&server, &claude(new)).await;
+    assert!(retried.is_ok(), "{retried:?}");
 }
