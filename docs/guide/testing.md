@@ -19,6 +19,7 @@ axum = "0.8"
 http = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tower = { version = "0.5", features = ["util"] }
+serde_json = "1"
 ```
 
 The fake's signing key is fixed and public, since it is in this crate's

@@ -84,7 +84,10 @@ now answers these paths, and its metadata points at them:
 
 App clients you created yourself keep working through these endpoints.
 The front passes their requests to Cognito unchanged, and Cognito checks
-them as before.
+them as before. Name each one on the verifier with
+[`client`](crate::AccessTokenVerifierBuilder::client) or
+[`clients`](crate::AccessTokenVerifierBuilder::clients), or the protected
+resource refuses its tokens with 401.
 
 # What each new app client gets
 
@@ -176,10 +179,10 @@ trust the redirect URI to send an error to. Registered clients keep
 working.
 
 Cognito allows five app-client changes per second per pool, shared with
-every other caller. Each server process makes at most ten a minute on
-behalf of requests, and answers 503 above that. Behind several instances,
-that is ten per instance, so also put a rate rule, such as an AWS WAF rule,
-in front of `/oauth2/authorize` and `/oauth2/register`.
+every other caller. Each registrar makes at most ten a minute on behalf
+of requests, and answers 503 above that. Build one per process. Behind
+several instances, that is ten per instance, so also put a rate rule, such
+as an AWS WAF rule, in front of `/oauth2/authorize` and `/oauth2/register`.
 
 # Clean up unused clients
 

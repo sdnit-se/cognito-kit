@@ -107,7 +107,10 @@ public addresses.
   its query string, so they reach your access logs. They are single-use,
   short-lived, and useless without the client's PKCE verifier.
 - **Users and pools.** The crate doesn't create users or change pool
-  settings. The registrar changes only the app clients it created.
+  settings. The registrar changes only app clients whose names start with
+  its `name_prefix`. Cleanup deletes such a client when it has no
+  registration and is more than an hour old, so give each registrar that
+  shares a pool its own prefix.
 
 # Supported Rust versions
 

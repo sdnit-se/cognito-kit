@@ -39,16 +39,17 @@ all of these hold:
 - It has not expired. A token stays valid for 60 seconds past its `exp`, for
   clock skew. Change that with [`leeway`](crate::AccessTokenVerifierBuilder::leeway).
 - Its `token_use` is `access`, so an ID token is refused.
-- Its `client_id` is one of the app clients you named.
+- Its `client_id` is one of the app clients you named, or one the
+  [`registrar`](crate::AccessTokenVerifierBuilder::registrar) registered.
 - Its `aud` is your API's URL, if you set
   [`audience`](crate::AccessTokenVerifierBuilder::audience) or
   [`resource`](crate::AccessTokenVerifierBuilder::resource).
 - It grants every scope you required with
   [`scope`](crate::AccessTokenVerifierBuilder::scope).
 
-A verifier needs at least one app client. Every app client in a pool gets
-tokens from the same keys, so without that check a token issued to any app
-in the pool would pass.
+A verifier needs at least one app client, or a registrar. Every app client
+in a pool gets tokens from the same keys, so without that check a token
+issued to any app in the pool would pass.
 
 Cognito sets `aud` on an access token only when the client sent your URL as
 the RFC 8707 `resource` parameter while signing in. Require an audience
