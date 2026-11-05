@@ -102,13 +102,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 managed login. Give it the URL that your app redirected to, and it returns
 the URL managed login sends the browser back to, with a code and the
 state. It refuses as Cognito does: an unknown app client, or a redirect
-URI that isn't one of the app client's callback URLs exactly.
+URI that isn't one of the app client's callback URLs exactly. Hand that
+URL's query to [`ManagedLogin::callback`](crate::ManagedLogin::callback),
+and the whole sign-in runs against the fake:
 
 ```rust
 use cognito_kit::AuthorizeOptions;
 use cognito_kit::test_kit::FakeCognito;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cognito = FakeCognito::new();
     let callback = "https://app.example.com/callback";
     let client = cognito.add_client("web", &[callback]);
@@ -117,21 +120,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .managed_login(cognito.login_domain(), client, callback.parse()?)
         .build()?;
 
-    let (to_cognito, _pending) = login.authorize(&AuthorizeOptions::default());
+    let (to_cognito, pending) = login.authorize(&AuthorizeOptions::default());
     let back = cognito.sign_in(&to_cognito, "user-1")?;
-    assert!(back.as_str().starts_with(callback));
-    assert!(back.query_pairs().any(|(name, _)| name == "code"));
+    let signed_in = login.callback::<()>(pending, back.query().unwrap_or_default()).await?;
+    assert_eq!(signed_in.claims.sub.to_string(), "user-1");
     Ok(())
 }
 ```
-
-The fake's ID tokens don't carry the nonce from the authorization request,
-so [`ManagedLogin::callback`](crate::ManagedLogin::callback) refuses them
-with [`LoginError::Nonce`](crate::LoginError::Nonce). To test a whole
-sign-in, answer the token endpoint with an [`HttpClient`](crate::HttpClient)
-of your own that signs an ID token with the nonce, as
-[`tests/web_sign_in.rs`](https://github.com/sdnit-se/cognito-kit/blob/main/tests/web_sign_in.rs)
-does.
 
 # Test self-registration
 

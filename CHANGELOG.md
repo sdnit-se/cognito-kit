@@ -22,6 +22,9 @@
   and so does one that a failed refresh left due. A document is fetched
   again after five minutes, or after one for a redirect URI it doesn't
   list.
+- `FakeCognito`'s ID tokens carry the sign-in's nonce, as Cognito's do, so
+  `ManagedLogin::callback` completes a sign-in against the fake. Before, it
+  always failed with `LoginError::Nonce`.
 - Docs: a guide on docs.rs with a chapter for each job, a shorter README,
   and `# Errors` and examples on the main types.
 
