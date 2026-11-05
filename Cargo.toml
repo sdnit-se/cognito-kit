@@ -11,7 +11,7 @@ documentation = "https://docs.rs/cognito-kit"
 readme = "README.md"
 keywords = ["cognito", "jwt", "oauth", "oidc", "mcp"]
 categories = ["authentication", "web-programming"]
-include = ["/src", "/examples", "/tests/*.rs", "/tests/support", "/tests/front", "/README.md", "/CHANGELOG.md", "/LICENSE", "/SECURITY.md"]
+include = ["/src", "/examples", "/tests/*.rs", "/tests/support", "/tests/front", "/docs/guide", "/README.md", "/CHANGELOG.md", "/LICENSE", "/SECURITY.md"]
 
 [features]
 default = ["reqwest"]
@@ -87,3 +87,11 @@ required-features = ["registration", "test-kit"]
 [lints.rust]
 missing_docs = "warn"
 unsafe_code = "forbid"
+
+[lints.rustdoc]
+broken_intra_doc_links = "deny"
+private_intra_doc_links = "deny"
+bare_urls = "deny"
+
+[lints.clippy]
+missing_errors_doc = "warn"

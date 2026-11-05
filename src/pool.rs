@@ -13,6 +13,20 @@ use crate::verify::{AccessTokenVerifierBuilder, IdTokenVerifier};
 ///
 /// Cheap to clone. Clones share one key cache, so build every verifier from
 /// the same `UserPool`.
+///
+/// # Examples
+///
+/// ```no_run
+/// use cognito_kit::{AccessClaims, UserPool};
+///
+/// # async fn run(token: &str) -> Result<(), Box<dyn std::error::Error>> {
+/// let pool = UserPool::new("eu-north-1_AbC123".parse()?);
+/// assert_eq!(pool.issuer(), "https://cognito-idp.eu-north-1.amazonaws.com/eu-north-1_AbC123");
+///
+/// let api = pool.access_tokens().client("1example23456789".parse()?).build()?;
+/// let claims: AccessClaims = api.verify(token).await?;
+/// # Ok(()) }
+/// ```
 #[derive(Clone)]
 pub struct UserPool {
     inner: Arc<Inner>,

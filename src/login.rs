@@ -220,7 +220,12 @@ impl ManagedLoginBuilder {
         self
     }
 
-    /// Checks the redirect URI: https, or http on localhost.
+    /// The sign-in, once the redirect URI is checked.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Url`] if the redirect URI is neither https nor http on
+    /// localhost, or has a fragment.
     pub fn build(self) -> Result<ManagedLogin, ConfigError> {
         check_url(&self.redirect_uri)?;
         let mut scopes = vec!["openid"];
@@ -239,6 +244,34 @@ impl ManagedLoginBuilder {
 
 /// Web sign-in for one app client through Cognito's managed login, with
 /// PKCE, state and nonce.
+///
+/// Cheap to clone. [The web sign-in chapter](crate::guide::web_sign_in)
+/// walks through a whole sign-in.
+///
+/// # Examples
+///
+/// ```no_run
+/// use cognito_kit::{AuthorizeOptions, UserPool};
+///
+/// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+/// let pool = UserPool::new("eu-north-1_AbC123".parse()?);
+/// let login = pool
+///     .managed_login(
+///         "https://login.example.com".parse()?,
+///         "1example23456789".parse()?,
+///         "https://app.example.com/callback".parse()?,
+///     )
+///     .build()?;
+///
+/// // GET /login: redirect the browser to `url`, and keep `pending`.
+/// let (url, pending) = login.authorize(&AuthorizeOptions::default());
+///
+/// // GET /callback: pass the query string back with what you kept.
+/// # let query = "";
+/// let signed_in = login.callback::<()>(pending, query).await?;
+/// println!("{} signed in", signed_in.claims.sub);
+/// # Ok(()) }
+/// ```
 #[derive(Clone)]
 pub struct ManagedLogin {
     http: Http,
@@ -302,6 +335,16 @@ impl ManagedLogin {
     /// Completes a sign-in from the callback's query string: checks `state`,
     /// redeems the code with the PKCE verifier, and verifies the ID token and
     /// its nonce.
+    ///
+    /// # Errors
+    ///
+    /// - [`LoginError::State`] if the callback's `state` isn't `pending`'s.
+    /// - [`LoginError::Denied`] if managed login sent back an error.
+    /// - [`LoginError::NoCode`] if the callback has neither.
+    /// - [`LoginError::Refused`] or [`LoginError::Http`] if redeeming the
+    ///   code fails.
+    /// - [`LoginError::IdToken`] or [`LoginError::Nonce`] if the ID token
+    ///   doesn't verify or isn't this sign-in's.
     pub async fn callback<C: DeserializeOwned>(
         &self,
         pending: PendingLogin,
@@ -347,6 +390,13 @@ impl ManagedLogin {
 
     /// New access and ID tokens. With rotation on, also a new refresh token,
     /// and `token` stops working.
+    ///
+    /// # Errors
+    ///
+    /// [`LoginError::Refused`] if Cognito refuses the token. With
+    /// [`OAuthError::is_invalid_grant`], the person must sign in again.
+    /// [`LoginError::Http`] if Cognito can't be reached, and
+    /// [`LoginError::IdToken`] if the new ID token doesn't verify.
     pub async fn refresh<C: DeserializeOwned>(
         &self,
         token: &RefreshToken,
@@ -356,6 +406,14 @@ impl ManagedLogin {
     }
 
     /// Revokes a refresh token and the access tokens issued with it.
+    ///
+    /// Verifiers check tokens without asking Cognito, so a revoked access
+    /// token still passes them until it expires.
+    ///
+    /// # Errors
+    ///
+    /// [`LoginError::Refused`] or [`LoginError::Http`] if the revocation
+    /// endpoint refuses or can't be reached.
     pub async fn revoke(&self, token: &RefreshToken) -> Result<(), LoginError> {
         self.post("/oauth2/revoke", &[("token", token.secret())])
             .await
