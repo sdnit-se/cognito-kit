@@ -276,6 +276,7 @@ struct Inner {
     name_prefix: String,
     known: Mutex<HashMap<ClientId, Instant>>,
     touched: Mutex<HashMap<String, Instant>>,
+    unchanged: Mutex<HashMap<String, Instant>>,
     writes: Mutex<VecDeque<Instant>>,
 }
 
@@ -400,6 +401,7 @@ impl RegistrarBuilder {
                 name_prefix: self.name_prefix,
                 known: Mutex::default(),
                 touched: Mutex::default(),
+                unchanged: Mutex::default(),
                 writes: Mutex::default(),
             }),
         })
@@ -607,21 +609,29 @@ impl Registrar {
         if let Some(stored) = &stored {
             let age = now.saturating_sub(stored.fetched_at);
             let listed = redirect::find(&stored.redirect_uris, redirect_uri).is_some();
-            if age < REFRESH.as_secs() && (listed || age < MIN_REFETCH.as_secs()) {
+            let fetched = age < REFRESH.as_secs() && (listed || age < MIN_REFETCH.as_secs());
+            // Or fetched within the minute and found unchanged while the
+            // writes were spent.
+            if fetched
+                || (stored.fetched_at != 0
+                    && fresh(&self.inner.unchanged, &url.as_str().to_owned(), MIN_REFETCH))
+            {
                 return Ok(stored.clone());
             }
         }
-        let body = match fetcher.fetch(url.url()).await {
-            Ok(body) => body,
-            Err(error) => {
-                return match stored {
-                    // A document that was valid stays usable while its host is down.
-                    Some(stored) if error.is_transient() => Ok(stored),
-                    _ => Err(RegistrationError::Fetch(error)),
-                };
-            }
+        let metadata = match fetcher.fetch(url.url()).await {
+            Ok(body) => document::parse(url, &body).map_err(RegistrationError::InvalidClient)?,
+            // A document that was valid stays usable while its host is down,
+            // once Cognito holds what the store does.
+            Err(error) => match &stored {
+                Some(stored) if error.is_transient() && stored.fetched_at != 0 => return Ok(stored.clone()),
+                Some(stored) if error.is_transient() => ClientMetadata {
+                    client_name: stored.client_name.clone(),
+                    redirect_uris: stored.redirect_uris.clone(),
+                },
+                _ => return Err(RegistrationError::Fetch(error)),
+            },
         };
-        let metadata = document::parse(url, &body).map_err(RegistrationError::InvalidClient)?;
         let metadata = self.trusted_uris(metadata)?;
         let Some(stored) = stored else {
             return self.create_document(url, metadata, relay).await;
@@ -629,12 +639,18 @@ impl Registrar {
         // A refresh that writes the store succeeds only once it has seen
         // Cognito hold what the store holds. Any other end leaves the
         // document due, so the next sign-in refreshes it and repairs what
-        // this one left apart.
+        // this one left apart. Until then, `fetched_at` is 0.
         if let Err(busy) = self.write() {
-            return if stored.redirect_uris == metadata.redirect_uris {
-                Ok(stored)
-            } else {
-                Err(busy)
+            // Without a write, only an unchanged document that Cognito
+            // already holds is used, as the store holds it now.
+            return match self.inner.store.get(url.as_str()).await.map_err(unavailable)? {
+                Some(current)
+                    if current.fetched_at != 0 && current.redirect_uris == metadata.redirect_uris =>
+                {
+                    remember(&self.inner.unchanged, url.as_str().to_owned(), MIN_REFETCH);
+                    Ok(current)
+                }
+                _ => Err(busy),
             };
         }
         let registration = Registration {

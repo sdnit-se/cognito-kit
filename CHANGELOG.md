@@ -10,15 +10,18 @@
   writes the store first, then gives the app client what the store holds,
   and reads the store again until the two agree. A refresh that fails
   after its store write, such as one Cognito throttles, marks the document
-  due, so the next sign-in refreshes it and repairs the app client. If
-  that mark fails too, or a server stops between the two writes, they stay
-  apart until the document is due anyway, at most five minutes later.
+  due, so the next sign-in refreshes it and repairs the app client, from
+  the stored list if the document's host is down. If that mark fails too,
+  or a server stops between the two writes, they stay apart until the
+  document is due anyway, at most five minutes later.
 - A document refresh now updates its app client even when the document
   is unchanged, and counts against the ten app-client writes a minute that
   requests may cause per process. When they are spent, an unchanged
-  document is used as stored and stays due, and a changed one gets 503
-  `temporarily_unavailable`, as before. A document is fetched again after
-  five minutes, or after one for a redirect URI it doesn't list.
+  document is used as stored, stays due, and is fetched again at most once
+  a minute. A changed one gets 503 `temporarily_unavailable`, as before,
+  and so does one that a failed refresh left due. A document is fetched
+  again after five minutes, or after one for a redirect URI it doesn't
+  list.
 
 ## 0.3.0 (2026-11-04)
 
