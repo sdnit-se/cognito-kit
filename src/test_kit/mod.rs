@@ -62,6 +62,7 @@ struct Grant {
     client: ClientId,
     redirect_uri: String,
     challenge: Option<String>,
+    nonce: Option<String>,
     resource: Option<String>,
     scope: String,
     sub: String,
@@ -280,9 +281,10 @@ impl FakeCognito {
     /// Cognito does: an unknown client, or a redirect URI that isn't one of
     /// the app client's callback URLs exactly.
     ///
-    /// The ID token that the code later redeems for doesn't carry the
-    /// authorization request's nonce, so [`ManagedLogin::callback`](crate::ManagedLogin::callback)
-    /// refuses it.
+    /// The ID token that the code redeems for carries the authorization
+    /// request's nonce, as Cognito's does, so
+    /// [`ManagedLogin::callback`](crate::ManagedLogin::callback) completes the
+    /// sign-in.
     ///
     /// # Errors
     ///
@@ -317,6 +319,7 @@ impl FakeCognito {
             client,
             redirect_uri: redirect_uri.clone(),
             challenge,
+            nonce: param("nonce"),
             resource: param("resource"),
             scope: param("scope").unwrap_or_default(),
             sub: sub.to_owned(),
@@ -338,7 +341,8 @@ impl FakeCognito {
         if !self.0.clients.lock().unwrap().contains_key(&client) {
             return oauth_error("invalid_client");
         }
-        let grant = match param("grant_type") {
+        // Only the ID token a code redeems for carries the nonce.
+        let (grant, nonce) = match param("grant_type") {
             Some("authorization_code") => {
                 let grant = param("code").and_then(|c| self.0.codes.lock().unwrap().remove(c));
                 let Some(grant) = grant.filter(|g| g.client == client) else {
@@ -353,14 +357,15 @@ impl FakeCognito {
                         return oauth_error("invalid_grant");
                     }
                 }
-                grant
+                let nonce = grant.nonce.clone();
+                (grant, nonce)
             }
             // Rotation: each refresh token works once.
             Some("refresh_token") => {
                 let grant =
                     param("refresh_token").and_then(|t| self.0.refresh_tokens.lock().unwrap().remove(t));
                 match grant.filter(|g| g.client == client) {
-                    Some(grant) => grant,
+                    Some(grant) => (grant, None),
                     None => return oauth_error("invalid_grant"),
                 }
             }
@@ -378,10 +383,14 @@ impl FakeCognito {
             "token_type": "Bearer", "expires_in": 3600,
         });
         if grant.scope.split(' ').any(|s| s == "openid") {
-            body["id_token"] = json!(self.sign(&json!({
+            let mut id = json!({
                 "sub": grant.sub, "iss": self.0.issuer, "aud": grant.client.as_str(), "token_use": "id",
                 "cognito:username": grant.sub, "auth_time": now(), "iat": now(), "exp": now() + 3600,
-            })));
+            });
+            if let Some(nonce) = nonce {
+                id["nonce"] = json!(nonce);
+            }
+            body["id_token"] = json!(self.sign(&id));
         }
         json_response(200, &body)
     }
