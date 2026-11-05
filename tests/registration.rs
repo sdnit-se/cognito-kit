@@ -4,13 +4,17 @@
 
 mod front;
 
-use std::sync::Arc;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
-use cognito_kit::registration::{BoxFuture, Registrar, Registration, RegistrationStore};
+use cognito_kit::registration::{
+    AdminError, AppClients, BoxFuture, FetchDocument, FetchError, Registrar, Registration, RegistrationStore,
+};
 use cognito_kit::test_kit::{FakeCognito, MemoryStore};
 use cognito_kit::{BoxError, ClientId};
+use tokio::sync::Notify;
 
 use front::{
     Authorization, DRAFTS, Documents, MCP, ORIGIN, call_mcp, get, json, location, open_server, post_form,
@@ -441,6 +445,33 @@ async fn stale_writes_leave_a_newer_registration() {
     assert_eq!(left[0].redirect_uris, [CLAUDE_CALLBACK]);
 }
 
+#[tokio::test]
+async fn the_next_refresh_repairs_an_interrupted_one() {
+    let server = open_server();
+    server
+        .documents
+        .serve(CLAUDE, &claude_document(&[CLAUDE_CALLBACK]));
+    let auth = Authorization {
+        client_id: CLAUDE,
+        redirect_uri: CLAUDE_CALLBACK,
+        scope: DRAFTS,
+        resource: Some(MCP),
+        extra: &[],
+    };
+    sign_in(&server, &auth).await.unwrap();
+    // A refresh stored the document and stopped before Cognito got it.
+    let app_client = server.store.registrations().remove(0).app_client;
+    let lost = ["https://claude.ai/api/mcp/old_callback".to_owned()];
+    server
+        .cognito
+        .set_callback_urls(&app_client, &lost)
+        .await
+        .unwrap();
+    server.store.edit(CLAUDE, |r| r.fetched_at -= 600);
+    let signed_in = sign_in(&server, &auth).await;
+    assert!(signed_in.is_ok(), "{signed_in:?}");
+}
+
 #[test]
 fn refuses_at_startup_a_name_prefix_that_cognito_would_refuse() {
     let build = |prefix: &str| {
@@ -477,13 +508,22 @@ async fn leaves_an_app_client_managed_by_hand_to_cognito() {
 }
 
 /// A store with faults: a token request that uses `used_after_list` right
-/// after a cleanup lists the registrations, and touches that fail while
-/// `touch_fails` is set.
+/// after a cleanup lists the registrations, touches that fail while
+/// `touch_fails` is set, and updates in the `order` given.
 #[derive(Default)]
 struct Faulty {
     store: MemoryStore,
     used_after_list: Option<String>,
     touch_fails: Arc<AtomicBool>,
+    order: Option<Order>,
+}
+
+/// An update of a registration listing `then` waits until one listing
+/// `first` is written.
+struct Order {
+    first: String,
+    then: String,
+    written: Notify,
 }
 
 impl RegistrationStore for Faulty {
@@ -500,7 +540,17 @@ impl RegistrationStore for Faulty {
         self.store.insert(registration)
     }
     fn update<'a>(&'a self, registration: &'a Registration) -> BoxFuture<'a, Result<(), BoxError>> {
-        self.store.update(registration)
+        let lists = |uri: &String| registration.redirect_uris.contains(uri);
+        Box::pin(async move {
+            if let Some(order) = self.order.as_ref().filter(|o| lists(&o.then)) {
+                order.written.notified().await;
+            }
+            let written = self.store.update(registration).await;
+            if let Some(order) = self.order.as_ref().filter(|o| lists(&o.first)) {
+                order.written.notify_one();
+            }
+            written
+        })
     }
     fn touch<'a>(&'a self, client_id: &'a str, at: u64) -> BoxFuture<'a, Result<(), BoxError>> {
         if self.touch_fails.load(Ordering::SeqCst) {
@@ -591,4 +641,118 @@ async fn cleanup_keeps_a_client_whose_first_use_failed_to_record() {
     let report = server.registrar.cleanup().await.unwrap();
     assert_eq!(report.unused, 0, "a client in use is not unused");
     assert_eq!(server.store.registrations().len(), 1);
+}
+
+/// Answers fetches with these documents in turn, and with the last one from
+/// then on.
+struct Versions(Mutex<VecDeque<String>>);
+
+impl FetchDocument for Versions {
+    fn fetch<'a>(&'a self, _: &'a Url) -> BoxFuture<'a, Result<Vec<u8>, FetchError>> {
+        let mut left = self.0.lock().unwrap();
+        let body = if left.len() > 1 {
+            left.pop_front()
+        } else {
+            left.front().cloned()
+        };
+        Box::pin(async move { Ok(body.expect("a document").into_bytes()) })
+    }
+}
+
+/// A fake Cognito where a callback write listing `uri`, made once the
+/// store lists it too, waits until `release` is notified.
+struct SlowCognito {
+    cognito: FakeCognito,
+    store: MemoryStore,
+    uri: String,
+    release: Arc<Notify>,
+}
+
+impl AppClients for SlowCognito {
+    fn create<'a>(
+        &'a self,
+        name: &'a str,
+        callback_urls: &'a [String],
+    ) -> BoxFuture<'a, Result<ClientId, AdminError>> {
+        self.cognito.create(name, callback_urls)
+    }
+    fn set_callback_urls<'a>(
+        &'a self,
+        client: &'a ClientId,
+        urls: &'a [String],
+    ) -> BoxFuture<'a, Result<(), AdminError>> {
+        let stored = self
+            .store
+            .registrations()
+            .iter()
+            .any(|r| r.redirect_uris.contains(&self.uri));
+        let slow = stored && urls.contains(&self.uri);
+        Box::pin(async move {
+            if slow {
+                self.release.notified().await;
+            }
+            self.cognito.set_callback_urls(client, urls).await
+        })
+    }
+    fn delete<'a>(&'a self, client: &'a ClientId) -> BoxFuture<'a, Result<(), AdminError>> {
+        self.cognito.delete(client)
+    }
+    fn list<'a>(&'a self, prefix: &'a str) -> BoxFuture<'a, Result<Vec<ClientId>, AdminError>> {
+        self.cognito.list(prefix)
+    }
+    fn created<'a>(&'a self, client: &'a ClientId) -> BoxFuture<'a, Result<SystemTime, AdminError>> {
+        self.cognito.created(client)
+    }
+}
+
+#[tokio::test]
+async fn a_new_redirect_uri_works_after_refreshes_that_overtake_each_other() {
+    let old = "https://claude.ai/api/mcp/auth_callback/2";
+    let new = "https://claude.ai/api/mcp/auth_callback/3";
+    // Two sign-ins refresh Claude's document while it moves its callback, so
+    // one fetch gets the old document and the other the new. Both read the
+    // store before either writes, the old document is stored first, and its
+    // Cognito write lands last.
+    let store = MemoryStore::new();
+    let release = Arc::new(Notify::new());
+    let fake = FakeCognito::new();
+    let cognito = SlowCognito {
+        cognito: fake.clone(),
+        store: store.clone(),
+        uri: old.to_owned(),
+        release: release.clone(),
+    };
+    let faulty = Faulty {
+        store: store.clone(),
+        order: Some(Order {
+            first: old.to_owned(),
+            then: new.to_owned(),
+            written: Notify::new(),
+        }),
+        ..Faulty::default()
+    };
+    let documents = [CLAUDE_CALLBACK, new, old, new].map(|uri| claude_document(&[uri]));
+    let registrar = Registrar::builder(cognito, faulty)
+        .fetcher(Versions(Mutex::new(documents.into())))
+        .client_hosts(["claude.ai"])
+        .build()
+        .unwrap();
+    let server = serve(fake, store, Documents::default(), registrar);
+    let auth = |redirect_uri| Authorization {
+        client_id: CLAUDE,
+        redirect_uri,
+        scope: DRAFTS,
+        resource: Some(MCP),
+        extra: &[],
+    };
+    sign_in(&server, &auth(CLAUDE_CALLBACK)).await.unwrap();
+    server.store.edit(CLAUDE, |r| r.fetched_at -= 600);
+
+    let refresh = || async {
+        get(&server.front, &authorize_url(CLAUDE, new, true)).await;
+        release.notify_one();
+    };
+    tokio::join!(refresh(), refresh());
+    let signed_in = sign_in(&server, &auth(new)).await;
+    assert!(signed_in.is_ok(), "{signed_in:?}");
 }
