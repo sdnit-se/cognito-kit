@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.1 (2026-11-05)
 
 - `FakeCognito`'s ID tokens carry the sign-in's nonce, as Cognito's do, so
   `ManagedLogin::callback` completes a sign-in against the fake. Before, it

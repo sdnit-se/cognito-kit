@@ -8,7 +8,7 @@ Pin it to the release that matches the crate:
 
 ```hcl
 module "cognito" {
-  source = "github.com/sdnit-se/cognito-kit//opentofu?ref=v0.3.0"
+  source = "github.com/sdnit-se/cognito-kit//opentofu?ref=v0.3.1"
 
   name   = "portal"
   domain = { name = "login.example.com", certificate_arn = var.certificate_arn }
