@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- **A client that changes its redirect URIs keeps signing in.** Two
+  sign-ins that refreshed one metadata document at once, while its
+  `redirect_uris` changed, could leave Cognito allowing the old list and
+  the store holding the new one, so sign-ins with the new URIs got
+  `redirect_mismatch` until the document changed again (#6). A refresh now
+  writes the store first, then gives the app client what the store holds,
+  and reads the store again until the two agree. The next refresh also
+  repairs one that stopped between the two writes.
+- Every document refresh now updates its app client, so each one counts
+  against the ten app-client writes a minute that requests may cause per
+  process. A document is fetched again after five minutes, or after one
+  for a redirect URI it doesn't list.
+
 ## 0.3.0 (2026-11-04)
 
 Assistants connect to an MCP server from its URL alone. They register

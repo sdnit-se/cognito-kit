@@ -623,23 +623,35 @@ impl Registrar {
         let Some(mut registration) = stored else {
             return self.create_document(url, metadata, relay).await;
         };
-        let after = callbacks(&metadata.redirect_uris, relay);
-        if callbacks(&registration.redirect_uris, relay) != after {
-            self.write()?;
-            self.inner
-                .app_clients
-                .set_callback_urls(&registration.app_client, &after)
-                .await?;
-        }
         registration.redirect_uris = metadata.redirect_uris;
         registration.client_name = metadata.client_name;
         registration.fetched_at = now;
+        self.write()?;
         self.inner
             .store
             .update(&registration)
             .await
             .map_err(unavailable)?;
-        Ok(registration)
+        // Concurrent refreshes interleave their writes. Each one writes
+        // Cognito after the store, then reads the store again until it
+        // holds what Cognito got, so the last Cognito write is the store's.
+        loop {
+            let urls = callbacks(&registration.redirect_uris, relay);
+            self.inner
+                .app_clients
+                .set_callback_urls(&registration.app_client, &urls)
+                .await?;
+            match self.inner.store.get(url.as_str()).await.map_err(unavailable)? {
+                Some(stored)
+                    if stored.app_client == registration.app_client
+                        && callbacks(&stored.redirect_uris, relay) != urls =>
+                {
+                    self.write()?;
+                    registration = stored;
+                }
+                _ => return Ok(registration),
+            }
+        }
     }
 
     /// Keeps the redirect URIs a code may be sent to, and refuses a
