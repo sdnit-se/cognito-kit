@@ -42,6 +42,8 @@ use crate::http_client::{BoxError, HttpClient};
 use crate::pool::UserPool;
 
 const KID: &str = "test-kit-1";
+/// Cognito's limit of callback URLs per app client.
+const MAX_CALLBACKS: usize = 100;
 
 /// An app client in the fake pool.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -223,7 +225,8 @@ impl FakeCognito {
     ///
     /// # Panics
     ///
-    /// If `callback_urls` is empty, or the pool is at the limit set with
+    /// If `callback_urls` is empty or has more than Cognito's 100, or the
+    /// pool is at the limit set with
     /// [`limit_app_clients`](Self::limit_app_clients).
     pub fn add_client(&self, name: &str, callback_urls: &[&str]) -> ClientId {
         let urls: Vec<String> = callback_urls.iter().map(|u| (*u).to_owned()).collect();
@@ -261,6 +264,9 @@ impl FakeCognito {
         }
         if callback_urls.is_empty() {
             return Err("InvalidOAuthFlowException");
+        }
+        if callback_urls.len() > MAX_CALLBACKS {
+            return Err("InvalidParameterException");
         }
         let id: ClientId = self.random().parse().expect("an app client id");
         clients.insert(
@@ -428,7 +434,7 @@ mod registration {
     use super::FakeCognito;
     use crate::config::ClientId;
     use crate::http_client::BoxError;
-    use crate::registration::{AdminError, AppClients, BoxFuture, Registration, RegistrationStore};
+    use crate::registration::{AdminError, AppClients, BoxFuture, Lease, Registration, RegistrationStore};
 
     impl AppClients for FakeCognito {
         fn create<'a>(
@@ -466,6 +472,9 @@ mod registration {
             let result = match clients.get_mut(client) {
                 Some(_) if urls.is_empty() => {
                     Err(AdminError::Other(Arc::new("InvalidOAuthFlowException".into())))
+                }
+                Some(_) if urls.len() > super::MAX_CALLBACKS => {
+                    Err(AdminError::Other(Arc::new("InvalidParameterException".into())))
                 }
                 Some(found) => {
                     found.callback_urls = urls.to_vec();
@@ -526,7 +535,13 @@ mod registration {
     /// # Ok::<(), cognito_kit::ConfigError>(())
     /// ```
     #[derive(Clone, Default)]
-    pub struct MemoryStore(Arc<Mutex<BTreeMap<String, Registration>>>);
+    pub struct MemoryStore(Arc<Mutex<Memory>>);
+
+    #[derive(Default)]
+    struct Memory {
+        registrations: BTreeMap<String, Registration>,
+        leases: BTreeMap<String, Lease>,
+    }
 
     impl MemoryStore {
         /// An empty store.
@@ -536,14 +551,14 @@ mod registration {
 
         /// Every registration, for assertions.
         pub fn registrations(&self) -> Vec<Registration> {
-            self.0.lock().unwrap().values().cloned().collect()
+            self.0.lock().unwrap().registrations.values().cloned().collect()
         }
 
         /// Changes a stored registration, for tests that need one in a given
         /// state, such as long unused. `change` runs with the store locked,
         /// so it must not use the store.
         pub fn edit(&self, client_id: &str, change: impl FnOnce(&mut Registration)) {
-            if let Some(registration) = self.0.lock().unwrap().get_mut(client_id) {
+            if let Some(registration) = self.0.lock().unwrap().registrations.get_mut(client_id) {
                 change(registration);
             }
         }
@@ -555,7 +570,7 @@ mod registration {
 
     impl RegistrationStore for MemoryStore {
         fn get<'a>(&'a self, client_id: &'a str) -> BoxFuture<'a, Result<Option<Registration>, BoxError>> {
-            ready(Ok(self.0.lock().unwrap().get(client_id).cloned()))
+            ready(Ok(self.0.lock().unwrap().registrations.get(client_id).cloned()))
         }
 
         fn get_by_app_client<'a>(
@@ -566,6 +581,7 @@ mod registration {
                 .0
                 .lock()
                 .unwrap()
+                .registrations
                 .values()
                 .find(|r| r.app_client == *app_client)
                 .cloned();
@@ -573,41 +589,85 @@ mod registration {
         }
 
         fn insert(&self, registration: Registration) -> BoxFuture<'_, Result<Registration, BoxError>> {
-            let mut all = self.0.lock().unwrap();
-            let stored = all
+            let mut memory = self.0.lock().unwrap();
+            let stored = memory
+                .registrations
                 .entry(registration.client_id.clone())
                 .or_insert(registration)
                 .clone();
             ready(Ok(stored))
         }
 
-        fn update<'a>(&'a self, registration: &'a Registration) -> BoxFuture<'a, Result<(), BoxError>> {
-            let mut all = self.0.lock().unwrap();
-            let stored = all
+        fn lease<'a>(
+            &'a self,
+            client_id: &'a str,
+            lease: &'a Lease,
+            now: u64,
+        ) -> BoxFuture<'a, Result<Option<Registration>, BoxError>> {
+            let mut memory = self.0.lock().unwrap();
+            let free = memory.leases.get(client_id).is_none_or(|held| held.until <= now);
+            let leased = memory.registrations.get(client_id).filter(|_| free).cloned();
+            if leased.is_some() {
+                memory.leases.insert(client_id.to_owned(), lease.clone());
+            }
+            ready(Ok(leased))
+        }
+
+        fn update<'a>(
+            &'a self,
+            registration: &'a Registration,
+            lease: &'a Lease,
+        ) -> BoxFuture<'a, Result<bool, BoxError>> {
+            let mut memory = self.0.lock().unwrap();
+            let holds = memory
+                .leases
+                .get(&registration.client_id)
+                .is_some_and(|held| held.owner == lease.owner);
+            let stored = memory
+                .registrations
                 .get_mut(&registration.client_id)
-                .filter(|r| r.app_client == registration.app_client);
+                .filter(|_| holds);
+            let updated = stored.is_some();
             if let Some(stored) = stored {
                 stored.redirect_uris = registration.redirect_uris.clone();
                 stored.client_name = registration.client_name.clone();
                 stored.fetched_at = registration.fetched_at;
             }
+            ready(Ok(updated))
+        }
+
+        fn release<'a>(
+            &'a self,
+            client_id: &'a str,
+            lease: &'a Lease,
+        ) -> BoxFuture<'a, Result<(), BoxError>> {
+            let mut memory = self.0.lock().unwrap();
+            if memory
+                .leases
+                .get(client_id)
+                .is_some_and(|held| held.owner == lease.owner)
+            {
+                memory.leases.remove(client_id);
+            }
             ready(Ok(()))
         }
 
         fn touch<'a>(&'a self, client_id: &'a str, at: u64) -> BoxFuture<'a, Result<(), BoxError>> {
-            if let Some(stored) = self.0.lock().unwrap().get_mut(client_id) {
+            if let Some(stored) = self.0.lock().unwrap().registrations.get_mut(client_id) {
                 stored.last_used = Some(at);
             }
             ready(Ok(()))
         }
 
         fn remove<'a>(&'a self, registration: &'a Registration) -> BoxFuture<'a, Result<(), BoxError>> {
-            let mut all = self.0.lock().unwrap();
-            if all
+            let mut memory = self.0.lock().unwrap();
+            if memory
+                .registrations
                 .get(&registration.client_id)
                 .is_some_and(|r| r.app_client == registration.app_client)
             {
-                all.remove(&registration.client_id);
+                memory.registrations.remove(&registration.client_id);
+                memory.leases.remove(&registration.client_id);
             }
             ready(Ok(()))
         }

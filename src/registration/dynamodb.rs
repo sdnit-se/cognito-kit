@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 
 use aws_sdk_dynamodb::Client;
-use aws_sdk_dynamodb::error::ProvideErrorMetadata;
+use aws_sdk_dynamodb::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
-use aws_sdk_dynamodb::types::{AttributeValue, Delete, Put, TransactWriteItem};
+use aws_sdk_dynamodb::types::{AttributeValue, Delete, Put, ReturnValue, TransactWriteItem};
 
-use super::{BoxFuture, Registration, RegistrationKind, RegistrationStore};
+use super::{BoxFuture, Lease, Registration, RegistrationKind, RegistrationStore};
 use crate::config::ClientId;
 use crate::http_client::BoxError;
 
@@ -14,8 +14,9 @@ type Item = HashMap<String, AttributeValue>;
 /// [`RegistrationStore`] in a DynamoDB table whose partition key is a
 /// string named `pk`, with no sort key. The OpenTofu module creates one.
 ///
-/// Each registration is an item under `client#<client_id>`, with a second
-/// item under `app#<app client id>` that points back to it. The caller
+/// Each registration is an item under `client#<client_id>`, with its lease
+/// as `lease_owner` and `lease_until`, and a second item under
+/// `app#<app client id>` that points back to it. The caller
 /// needs `dynamodb:GetItem`, `PutItem`, `UpdateItem`, `DeleteItem` and `Scan`
 /// on the table.
 #[derive(Clone)]
@@ -93,7 +94,35 @@ impl DynamoStore {
         }
     }
 
-    async fn update(&self, registration: &Registration) -> Result<(), BoxError> {
+    async fn lease(
+        &self,
+        client_id: &str,
+        lease: &Lease,
+        now: u64,
+    ) -> Result<Option<Registration>, BoxError> {
+        let leased = self
+            .client
+            .update_item()
+            .table_name(&self.table)
+            .key("pk", AttributeValue::S(format!("client#{client_id}")))
+            .update_expression("SET lease_owner = :owner, lease_until = :until")
+            .condition_expression(
+                "attribute_exists(pk) AND (attribute_not_exists(lease_until) OR lease_until <= :now)",
+            )
+            .expression_attribute_values(":owner", AttributeValue::S(lease.owner.clone()))
+            .expression_attribute_values(":until", AttributeValue::N(lease.until.to_string()))
+            .expression_attribute_values(":now", AttributeValue::N(now.to_string()))
+            .return_values(ReturnValue::AllNew)
+            .send()
+            .await;
+        match leased {
+            Ok(output) => output.attributes.map(|item| registration(&item)).transpose(),
+            Err(error) if refused(&error) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn update(&self, registration: &Registration, lease: &Lease) -> Result<bool, BoxError> {
         let uris = registration
             .redirect_uris
             .iter()
@@ -113,14 +142,32 @@ impl DynamoStore {
                 AttributeValue::S(format!("client#{}", registration.client_id)),
             )
             .update_expression("SET redirect_uris = :uris, client_name = :name, fetched_at = :at")
-            .condition_expression("app_client = :app")
-            .expression_attribute_values(":app", AttributeValue::S(registration.app_client.to_string()))
+            .condition_expression("lease_owner = :owner")
+            .expression_attribute_values(":owner", AttributeValue::S(lease.owner.clone()))
             .expression_attribute_values(":uris", AttributeValue::L(uris))
             .expression_attribute_values(":name", name)
             .expression_attribute_values(":at", AttributeValue::N(registration.fetched_at.to_string()))
             .send()
             .await;
-        ignore_removed(updated)
+        match updated {
+            Ok(_) => Ok(true),
+            Err(error) if refused(&error) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn release(&self, client_id: &str, lease: &Lease) -> Result<(), BoxError> {
+        let released = self
+            .client
+            .update_item()
+            .table_name(&self.table)
+            .key("pk", AttributeValue::S(format!("client#{client_id}")))
+            .update_expression("REMOVE lease_owner, lease_until")
+            .condition_expression("lease_owner = :owner")
+            .expression_attribute_values(":owner", AttributeValue::S(lease.owner.clone()))
+            .send()
+            .await;
+        ignore_removed(released)
     }
 
     async fn touch(&self, client_id: &str, at: u64) -> Result<(), BoxError> {
@@ -208,14 +255,19 @@ fn taken(error: Option<&TransactWriteItemsError>) -> bool {
         if e.cancellation_reasons().iter().any(|r| r.code() == Some("ConditionalCheckFailed")))
 }
 
+/// Whether a write's condition failed.
+fn refused<E: ProvideErrorMetadata>(error: &SdkError<E>) -> bool {
+    error.code() == Some("ConditionalCheckFailedException")
+}
+
 /// A registration that cleanup removed meanwhile stays removed.
-fn ignore_removed<T, E>(result: Result<T, aws_sdk_dynamodb::error::SdkError<E>>) -> Result<(), BoxError>
+fn ignore_removed<T, E>(result: Result<T, SdkError<E>>) -> Result<(), BoxError>
 where
     E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
 {
     match result {
         Ok(_) => Ok(()),
-        Err(error) if error.code() == Some("ConditionalCheckFailedException") => Ok(()),
+        Err(error) if refused(&error) => Ok(()),
         Err(error) => Err(error.into()),
     }
 }
@@ -316,8 +368,25 @@ impl RegistrationStore for DynamoStore {
         Box::pin(self.insert(registration))
     }
 
-    fn update<'a>(&'a self, registration: &'a Registration) -> BoxFuture<'a, Result<(), BoxError>> {
-        Box::pin(self.update(registration))
+    fn lease<'a>(
+        &'a self,
+        client_id: &'a str,
+        lease: &'a Lease,
+        now: u64,
+    ) -> BoxFuture<'a, Result<Option<Registration>, BoxError>> {
+        Box::pin(self.lease(client_id, lease, now))
+    }
+
+    fn update<'a>(
+        &'a self,
+        registration: &'a Registration,
+        lease: &'a Lease,
+    ) -> BoxFuture<'a, Result<bool, BoxError>> {
+        Box::pin(self.update(registration, lease))
+    }
+
+    fn release<'a>(&'a self, client_id: &'a str, lease: &'a Lease) -> BoxFuture<'a, Result<(), BoxError>> {
+        Box::pin(self.release(client_id, lease))
     }
 
     fn touch<'a>(&'a self, client_id: &'a str, at: u64) -> BoxFuture<'a, Result<(), BoxError>> {

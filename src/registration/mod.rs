@@ -27,6 +27,9 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -51,6 +54,13 @@ const MIN_REFETCH: Duration = Duration::from_secs(60);
 /// App-client writes that requests may cause per minute, per process.
 /// Cognito allows five per second per pool for every caller together.
 const WRITES_PER_MINUTE: usize = 10;
+/// How long a refresh may hold a document's registration: well above what
+/// its five Cognito and store calls take, and above API Gateway's 29
+/// seconds, so that a Lambda function whose timeout fits behind API Gateway
+/// is stopped before its lease runs out.
+const LEASE: Duration = Duration::from_secs(30);
+/// Cognito's limit of callback URLs per app client.
+const MAX_CALLBACKS: usize = 100;
 /// How long a check against Cognito or the store is reused.
 const KNOWN_FOR: Duration = Duration::from_secs(60);
 const TOUCH_EVERY: Duration = Duration::from_secs(3600);
@@ -95,11 +105,34 @@ pub struct Registration {
     pub fetched_at: u64,
 }
 
+/// A refresh's hold on one registration, so that refreshes in different
+/// processes take turns changing it and its app client. See
+/// [`RegistrationStore::lease`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Lease {
+    /// The refresh that holds it, a random value per refresh.
+    pub owner: String,
+    /// When it runs out, in seconds since the Unix epoch.
+    pub until: u64,
+}
+
+impl Lease {
+    /// A lease for `owner` that runs out at `until`.
+    pub fn new(owner: impl Into<String>, until: u64) -> Self {
+        Self {
+            owner: owner.into(),
+            until,
+        }
+    }
+}
+
 /// Keeps the [`Registrar`]'s registrations: which `client_id` maps to which
 /// app client. Every server instance must share one store.
 ///
 /// `DynamoStore` implements it with the `dynamodb` feature; implement it
-/// yourself for another database. [`Registration`] serializes to JSON.
+/// yourself for another database. [`Registration`] serializes to JSON. Keep
+/// each registration's [`Lease`] beside it, and remove both together.
 pub trait RegistrationStore: Send + Sync + 'static {
     /// The registration for a `client_id` as clients send it.
     fn get<'a>(&'a self, client_id: &'a str) -> BoxFuture<'a, Result<Option<Registration>, BoxError>>;
@@ -112,10 +145,28 @@ pub trait RegistrationStore: Send + Sync + 'static {
     /// what is stored under that `client_id` afterwards. Two servers that
     /// register one client at once both get the first one's registration.
     fn insert(&self, registration: Registration) -> BoxFuture<'_, Result<Registration, BoxError>>;
-    /// Replaces the stored `redirect_uris`, `client_name` and `fetched_at`,
-    /// unless the `client_id` has since been registered again with another
-    /// app client.
-    fn update<'a>(&'a self, registration: &'a Registration) -> BoxFuture<'a, Result<(), BoxError>>;
+    /// Gives the registration for `client_id` to `lease`, unless another
+    /// lease on it lasts past `now`, and returns the registration as stored
+    /// at that moment. `None` if another lease holds it, or there is no
+    /// registration. Must be one conditional write, so that of two callers
+    /// at once only one gets the lease.
+    fn lease<'a>(
+        &'a self,
+        client_id: &'a str,
+        lease: &'a Lease,
+        now: u64,
+    ) -> BoxFuture<'a, Result<Option<Registration>, BoxError>>;
+    /// Replaces the stored `redirect_uris`, `client_name` and `fetched_at`
+    /// if the registration's lease is still `lease`, by its owner, and
+    /// returns whether it did. A lease that ran out still counts until
+    /// another takes its place.
+    fn update<'a>(
+        &'a self,
+        registration: &'a Registration,
+        lease: &'a Lease,
+    ) -> BoxFuture<'a, Result<bool, BoxError>>;
+    /// Ends `lease` on the registration for `client_id`, if it still has it.
+    fn release<'a>(&'a self, client_id: &'a str, lease: &'a Lease) -> BoxFuture<'a, Result<(), BoxError>>;
     /// Sets `last_used`.
     fn touch<'a>(&'a self, client_id: &'a str, at: u64) -> BoxFuture<'a, Result<(), BoxError>>;
     /// Removes a registration, unless its `client_id` has since been
@@ -195,7 +246,8 @@ pub enum RegistrationError {
     /// many app clients as its quota allows.
     #[error("no room for another app client; unused ones are removed by cleanup")]
     Full,
-    /// Requests changed app clients too often in the last minute.
+    /// Requests changed app clients too often in the last minute, or
+    /// another server is refreshing the client's document.
     #[error("too many app client changes; try again in a minute")]
     Busy,
     /// Cognito's API or the store failed.
@@ -458,6 +510,15 @@ fn now() -> u64 {
         .as_secs()
 }
 
+/// A lease owner no other refresh has.
+fn owner() -> String {
+    let mut bytes = [0u8; 16];
+    SystemRandom::new()
+        .fill(&mut bytes)
+        .expect("the operating system's random source works");
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
 fn fresh<K: std::hash::Hash + Eq>(map: &Mutex<HashMap<K, Instant>>, key: &K, ttl: Duration) -> bool {
     let map = map.lock().unwrap_or_else(|e| e.into_inner());
     map.get(key).is_some_and(|at| at.elapsed() < ttl)
@@ -639,86 +700,116 @@ impl Registrar {
         }
         let stored = self.inner.store.get(url.as_str()).await.map_err(unavailable)?;
         let now = now();
+        let lists = |uris: &[String]| redirect::find(uris, redirect_uri).is_some();
         if let Some(stored) = &stored {
             let age = now.saturating_sub(stored.fetched_at);
-            let listed = redirect::find(&stored.redirect_uris, redirect_uri).is_some();
-            if age < REFRESH.as_secs() && (listed || age < MIN_REFETCH.as_secs()) {
+            if age < REFRESH.as_secs() && (lists(&stored.redirect_uris) || age < MIN_REFETCH.as_secs()) {
                 return Ok(stored.clone());
             }
         }
-        let body = match fetcher.fetch(url.url()).await {
-            Ok(body) => body,
-            Err(error) => {
-                return match stored {
-                    // A document that was valid stays usable while its host is down.
-                    Some(stored) if error.is_transient() => Ok(stored),
-                    _ => Err(RegistrationError::Fetch(error)),
-                };
-            }
+        let parse = |body: Vec<u8>| {
+            let metadata = document::parse(url, &body).map_err(RegistrationError::InvalidClient)?;
+            self.trusted_uris(metadata)
         };
-        let metadata = document::parse(url, &body).map_err(RegistrationError::InvalidClient)?;
-        let metadata = self.trusted_uris(metadata)?;
+        let fetched = fetcher.fetch(url.url()).await;
         let Some(stored) = stored else {
+            let metadata = parse(fetched.map_err(RegistrationError::Fetch)?)?;
             return self.create_document(url, metadata, relay).await;
         };
-        // Expand before the store can hold the new list. Cognito allows it,
-        // the stored list, and what it allows already, which can be another
-        // refresh's expansion. So whichever list a sign-in reads from the
-        // store, Cognito allows it.
-        let allowed: BTreeSet<String> = self
-            .inner
-            .app_clients
-            .callback_urls(&stored.app_client)
-            .await?
-            .into_iter()
-            .collect();
-        let new = callbacks(&metadata.redirect_uris, relay);
-        let old = callbacks(&stored.redirect_uris, relay);
-        let wanted: BTreeSet<String> = allowed.iter().chain(&old).chain(&new).cloned().collect();
-        if wanted != allowed {
-            self.write()?;
-            let wanted: Vec<String> = wanted.iter().cloned().collect();
-            self.inner
-                .app_clients
-                .set_callback_urls(&stored.app_client, &wanted)
-                .await?;
-        }
-        let registration = Registration {
-            redirect_uris: metadata.redirect_uris,
-            client_name: metadata.client_name,
-            fetched_at: now,
-            ..stored
+        let metadata = match fetched {
+            Ok(body) => Some(parse(body)?),
+            // A document that was valid stays usable while its host is
+            // down, and the refresh below brings Cognito to its stored list.
+            Err(error) if error.is_transient() => None,
+            Err(error) => return Err(RegistrationError::Fetch(error)),
         };
-        self.inner
+        let host_down = metadata.is_none();
+
+        // Refreshes take turns, also across processes. Cognito can't make a
+        // write conditional, so two refreshes of one document at once could
+        // cross.
+        let lease = Lease::new(owner(), now + LEASE.as_secs());
+        let leased = self
+            .inner
             .store
-            .update(&registration)
+            .lease(url.as_str(), &lease, now)
             .await
             .map_err(unavailable)?;
-        if wanted.iter().all(|url| new.contains(url)) {
-            return Ok(registration);
-        }
-        // Contract to the new list, but only while the store still holds it.
-        // A refresh that stored another list since expanded for it first.
-        // With no write to spare, or a refused one, Cognito keeps a superset
-        // for the next refresh to contract.
-        let current = self
-            .inner
-            .store
-            .get(url.as_str())
-            .await
-            .map_err(unavailable)?
-            .ok_or_else(|| unavailable("the registration was removed during its refresh".into()))?;
-        if current.app_client == registration.app_client
-            && current.redirect_uris == registration.redirect_uris
-            && self.write().is_ok()
-        {
-            let _ = self
+        let Some(leased) = leased else {
+            // Cognito allows every list the store holds while a refresh
+            // runs. A redirect URI that only the fetched document lists
+            // waits for that refresh to store it.
+            let new = metadata.as_ref().is_some_and(|m| lists(&m.redirect_uris));
+            return if new && !lists(&stored.redirect_uris) {
+                Err(RegistrationError::Busy)
+            } else {
+                Ok(stored)
+            };
+        };
+        let refreshed = async {
+            let registration = match metadata {
+                Some(metadata) => Registration {
+                    redirect_uris: metadata.redirect_uris,
+                    client_name: metadata.client_name,
+                    fetched_at: now,
+                    ..leased.clone()
+                },
+                None => leased.clone(),
+            };
+            let old = callbacks(&leased.redirect_uris, relay);
+            let new = callbacks(&registration.redirect_uris, relay);
+            let allowed: BTreeSet<String> = self
                 .inner
                 .app_clients
-                .set_callback_urls(&current.app_client, &new)
-                .await;
+                .callback_urls(&leased.app_client)
+                .await?
+                .into_iter()
+                .collect();
+            // Expand before the store holds the new list, so that whichever
+            // list a sign-in reads from the store, Cognito allows it. Past
+            // Cognito's limit, Cognito gets the new list alone, and still
+            // before the store, so that only a redirect URI the document
+            // dropped is refused meanwhile.
+            let mut wanted: BTreeSet<String> = allowed.iter().chain(&old).chain(&new).cloned().collect();
+            if wanted.len() > MAX_CALLBACKS {
+                wanted = new.iter().cloned().collect();
+            }
+            if wanted != allowed {
+                self.write()?;
+                let wanted: Vec<String> = wanted.iter().cloned().collect();
+                self.inner
+                    .app_clients
+                    .set_callback_urls(&leased.app_client, &wanted)
+                    .await?;
+            }
+            // A refresh whose lease ran out and was taken over stops here,
+            // and leaves the rest to the one that took it.
+            let landed = self
+                .inner
+                .store
+                .update(&registration, &lease)
+                .await
+                .map_err(unavailable)?;
+            if !landed {
+                return Err(unavailable("another refresh took the registration over".into()));
+            }
+            // Contract. With no write to spare, or a refused one, Cognito
+            // keeps a superset for the next refresh to contract.
+            if wanted.iter().any(|url| !new.contains(url)) && self.write().is_ok() {
+                let _ = self
+                    .inner
+                    .app_clients
+                    .set_callback_urls(&leased.app_client, &new)
+                    .await;
+            }
+            Ok(registration)
         }
-        Ok(current)
+        .await;
+        let _ = self.inner.store.release(url.as_str(), &lease).await;
+        match refreshed {
+            Err(_) if host_down => Ok(leased),
+            refreshed => refreshed,
+        }
     }
 
     /// Keeps the redirect URIs a code may be sent to, and refuses a
