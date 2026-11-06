@@ -3,6 +3,7 @@
 // saved report on its own:
 //
 //   bun tests/live/outcomes.ts <report.json>
+import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 
 type Check = [name: string, ok: (outcome: any) => boolean];
@@ -16,11 +17,18 @@ const scripted: Check[] = [
   ['reused refresh token refused', (f) => f.reusedRefreshToken === 'invalid_grant'],
 ];
 
-/// Codex logs in by its metadata document, whose URL is its client_id, or
-/// by registering, which gives it the app client's id.
+/// The URL of Codex's metadata document for an MCP server, which names the
+/// server by the start of its URL's SHA-256, as Codex 0.164 builds it.
+const codexDocument = (server: string) =>
+  `https://chatgpt.com/oauth/codex/${createHash('sha256').update(server).digest('base64url').slice(0, 12)}/client.json`;
+
+/// Codex logs in by its metadata document, whose URL is then its client_id,
+/// or by registering, which returns the client_id it must use.
 const codex = (byDocument: boolean): Check[] => [
   ['login done', (f) => f.exit === 0],
-  [byDocument ? 'client_id is the document URL' : 'client_id is the registered one', (f) => f.clientIdIsUrl === byDocument],
+  byDocument
+    ? ['client_id is Codex\'s document URL', (f) => typeof f.server === 'string' && f.clientId === codexDocument(f.server)]
+    : ['client_id is the one its registration returned', (f) => typeof f.clientId === 'string' && f.registered?.includes(f.clientId)],
   ['credentials stored', (f) => f.stored === true],
   ['MCP 200', (f) => f.mcp === 200],
 ];

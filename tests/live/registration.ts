@@ -80,6 +80,15 @@ function listen(port: number) {
   return Bun.serve({ port, hostname: '127.0.0.1', fetch: () => new Response('ok') });
 }
 
+/// The client_id of each dynamic registration in the table.
+function registeredClients(): string[] {
+  const scan = aws('dynamodb', 'scan', '--table-name', TABLE, '--consistent-read',
+    '--filter-expression', '#kind = :dynamic', '--projection-expression', 'client_id',
+    '--expression-attribute-names', JSON.stringify({ '#kind': 'kind' }),
+    '--expression-attribute-values', JSON.stringify({ ':dynamic': { S: 'dynamic' } }));
+  return scan.Items.map((item: any) => item.client_id.S);
+}
+
 /// Follows an authorization URL through managed login to the loopback callback.
 async function browse(authorize: string): Promise<URL> {
   const arrived = new Promise<URL>((resolve) => (onCallback = resolve));
@@ -232,6 +241,7 @@ try {
   // The real Codex CLI, by document and by registration.
   const codex = process.env.CODEX ?? 'codex';
   for (const strategy of ['cimd', 'dcr']) report[`codexBy${strategy}`] = await attempt(async () => {
+    const before = registeredClients();
     const home = mkdtempSync(join(tmpdir(), 'codex-live-'));
     writeFileSync(join(home, 'config.toml'), `mcp_oauth_credentials_store = "file"\n[mcp_servers.portal]\nurl = "${MCP}"\n`);
     const child = Bun.spawn([codex, 'mcp', 'login', 'portal', '--no-browser', '--oauth-client-registration', strategy], {
@@ -266,7 +276,8 @@ try {
       const credentials = stored.length ? readFileSync(join(home, stored[0]), 'utf8') : '';
       const access = /"access_token"\s*:\s*"([^"]+)"/.exec(credentials)?.[1];
       return {
-        exit, clientIdIsUrl: sent.searchParams.get('client_id')?.startsWith('https://'),
+        exit, server: MCP, clientId: sent.searchParams.get('client_id'),
+        registered: registeredClients().filter((id) => !before.includes(id)),
         redirect: sent.searchParams.get('redirect_uri')?.replace(/:\d+\//, ':<port>/'),
         resource: sent.searchParams.get('resource'), stored: stored.length > 0,
         access: access ? { aud: claimsOf(access).aud, scope: claimsOf(access).scope } : null,
