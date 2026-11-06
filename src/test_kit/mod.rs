@@ -443,6 +443,20 @@ mod registration {
             Box::pin(async move { created })
         }
 
+        fn callback_urls<'a>(
+            &'a self,
+            client: &'a ClientId,
+        ) -> BoxFuture<'a, Result<Vec<String>, AdminError>> {
+            let found = self
+                .0
+                .clients
+                .lock()
+                .unwrap()
+                .get(client)
+                .map(|c| c.callback_urls.clone());
+            Box::pin(async move { found.ok_or(AdminError::NotFound) })
+        }
+
         fn set_callback_urls<'a>(
             &'a self,
             client: &'a ClientId,

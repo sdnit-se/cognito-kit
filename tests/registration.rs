@@ -1,20 +1,26 @@
 //! What an attacker, or an operator watching the pool, would notice about
 //! client registration: where codes may go, which documents count, which
-//! tokens pass, and how app clients are kept in check.
+//! tokens pass, and how app clients are kept in check. And what a person
+//! signing in meets while a client's document changes.
 
 mod front;
 
-use std::sync::Arc;
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
-use cognito_kit::registration::{BoxFuture, Registrar, Registration, RegistrationStore};
+use cognito_kit::registration::{
+    AdminError, AppClients, BoxFuture, Registrar, Registration, RegistrationStore,
+};
 use cognito_kit::test_kit::{FakeCognito, MemoryStore};
 use cognito_kit::{BoxError, ClientId};
+use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 
 use front::{
-    Authorization, DRAFTS, Documents, MCP, ORIGIN, call_mcp, get, json, location, open_server, post_form,
-    post_json, serve, server, sign_in,
+    Authorization, DRAFTS, Documents, MCP, ORIGIN, Server, call_mcp, get, json, location, open_server,
+    post_form, post_json, serve, server, sign_in,
 };
 use http::StatusCode;
 use serde_json::json;
@@ -22,6 +28,8 @@ use url::Url;
 
 const CLAUDE: &str = "https://claude.ai/oauth/mcp-oauth-client-metadata";
 const CLAUDE_CALLBACK: &str = "https://claude.ai/api/mcp/auth_callback";
+const MOVED: &str = "https://claude.ai/api/mcp/auth_callback/2";
+const MOVED_AGAIN: &str = "https://claude.ai/api/mcp/auth_callback/3";
 
 fn claude_document(redirect_uris: &[&str]) -> String {
     json!({
@@ -54,6 +62,16 @@ fn registration(redirect_uris: &[&str]) -> serde_json::Value {
 }
 
 const REGISTER: &str = "https://portal.example.com/oauth2/register";
+
+fn claude(redirect_uri: &str) -> Authorization<'_> {
+    Authorization {
+        client_id: CLAUDE,
+        redirect_uri,
+        scope: DRAFTS,
+        resource: Some(MCP),
+        extra: &[],
+    }
+}
 
 #[tokio::test]
 async fn refuses_a_document_that_does_not_list_the_redirect_uri() {
@@ -591,4 +609,428 @@ async fn cleanup_keeps_a_client_whose_first_use_failed_to_record() {
     let report = server.registrar.cleanup().await.unwrap();
     assert_eq!(report.unused, 0, "a client in use is not unused");
     assert_eq!(server.store.registrations().len(), 1);
+}
+
+/// While holding, every app-client and store call that a [`Held`] server
+/// makes waits until the test lets it go, so a test can step through a
+/// refresh, or run two in any order.
+#[derive(Clone, Default)]
+struct Steps(Arc<Calls>);
+
+#[derive(Default)]
+struct Calls {
+    holding: AtomicBool,
+    held: Mutex<Vec<oneshot::Sender<()>>>,
+}
+
+impl Steps {
+    fn hold(&self) {
+        self.0.holding.store(true, Ordering::SeqCst);
+    }
+
+    async fn wait(&self) {
+        if self.0.holding.load(Ordering::SeqCst) {
+            let (go, gone) = oneshot::channel();
+            self.0.held.lock().unwrap().push(go);
+            let _ = gone.await;
+        }
+    }
+
+    /// Waits until each task has a call held or has finished, and returns
+    /// whether a call is held.
+    async fn settle<T>(&self, tasks: &[JoinHandle<T>]) -> bool {
+        loop {
+            let held = self.0.held.lock().unwrap().len();
+            if held + tasks.iter().filter(|t| t.is_finished()).count() == tasks.len() {
+                return held > 0;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Lets the held call that `order` picks go.
+    fn release(&self, order: &Order) {
+        let mut held = self.0.held.lock().unwrap();
+        let pick = if held.len() > 1 { order.pick(held.len()) } else { 0 };
+        let _ = held.remove(pick).send(());
+    }
+}
+
+/// The choices one run makes among held calls: those in `prefix`, then the
+/// first. `taken` records each choice and how many there were.
+#[derive(Clone, Default)]
+struct Order(Arc<Mutex<Choices>>);
+
+#[derive(Default)]
+struct Choices {
+    prefix: Vec<usize>,
+    taken: Vec<(usize, usize)>,
+}
+
+impl Order {
+    fn pick(&self, of: usize) -> usize {
+        let mut choices = self.0.lock().unwrap();
+        let chosen = choices.prefix.get(choices.taken.len()).copied().unwrap_or(0);
+        choices.taken.push((chosen, of));
+        chosen
+    }
+
+    fn taken(&self) -> Vec<(usize, usize)> {
+        self.0.lock().unwrap().taken.clone()
+    }
+}
+
+/// Runs `scenario` once for each order in which its held calls can go, and
+/// returns how many orders there were.
+async fn every_order<F: Future<Output = ()>>(scenario: impl Fn(Order) -> F) -> usize {
+    let mut prefix = Vec::new();
+    let mut runs = 0;
+    loop {
+        let order = Order(Arc::new(Mutex::new(Choices {
+            prefix,
+            taken: Vec::new(),
+        })));
+        scenario(order.clone()).await;
+        runs += 1;
+        let taken = order.taken();
+        let Some(last) = taken.iter().rposition(|&(chosen, of)| chosen + 1 < of) else {
+            return runs;
+        };
+        prefix = taken[..last]
+            .iter()
+            .map(|&(chosen, _)| chosen)
+            .chain([taken[last].0 + 1])
+            .collect();
+    }
+}
+
+/// One server's view of a pool and store that others share, with its calls
+/// held at `steps`.
+#[derive(Clone)]
+struct Held {
+    cognito: FakeCognito,
+    store: MemoryStore,
+    steps: Steps,
+}
+
+impl AppClients for Held {
+    fn create<'a>(
+        &'a self,
+        name: &'a str,
+        callback_urls: &'a [String],
+    ) -> BoxFuture<'a, Result<ClientId, AdminError>> {
+        Box::pin(async move {
+            self.steps.wait().await;
+            self.cognito.create(name, callback_urls).await
+        })
+    }
+    fn callback_urls<'a>(&'a self, client: &'a ClientId) -> BoxFuture<'a, Result<Vec<String>, AdminError>> {
+        Box::pin(async move {
+            self.steps.wait().await;
+            self.cognito.callback_urls(client).await
+        })
+    }
+    fn set_callback_urls<'a>(
+        &'a self,
+        client: &'a ClientId,
+        urls: &'a [String],
+    ) -> BoxFuture<'a, Result<(), AdminError>> {
+        Box::pin(async move {
+            self.steps.wait().await;
+            self.cognito.set_callback_urls(client, urls).await
+        })
+    }
+    fn delete<'a>(&'a self, client: &'a ClientId) -> BoxFuture<'a, Result<(), AdminError>> {
+        Box::pin(async move {
+            self.steps.wait().await;
+            self.cognito.delete(client).await
+        })
+    }
+    fn list<'a>(&'a self, prefix: &'a str) -> BoxFuture<'a, Result<Vec<ClientId>, AdminError>> {
+        Box::pin(async move {
+            self.steps.wait().await;
+            self.cognito.list(prefix).await
+        })
+    }
+    fn created<'a>(&'a self, client: &'a ClientId) -> BoxFuture<'a, Result<SystemTime, AdminError>> {
+        Box::pin(async move {
+            self.steps.wait().await;
+            self.cognito.created(client).await
+        })
+    }
+}
+
+impl RegistrationStore for Held {
+    fn get<'a>(&'a self, client_id: &'a str) -> BoxFuture<'a, Result<Option<Registration>, BoxError>> {
+        Box::pin(async move {
+            self.steps.wait().await;
+            self.store.get(client_id).await
+        })
+    }
+    fn get_by_app_client<'a>(
+        &'a self,
+        app_client: &'a ClientId,
+    ) -> BoxFuture<'a, Result<Option<Registration>, BoxError>> {
+        Box::pin(async move {
+            self.steps.wait().await;
+            self.store.get_by_app_client(app_client).await
+        })
+    }
+    fn insert(&self, registration: Registration) -> BoxFuture<'_, Result<Registration, BoxError>> {
+        Box::pin(async move {
+            self.steps.wait().await;
+            self.store.insert(registration).await
+        })
+    }
+    fn update<'a>(&'a self, registration: &'a Registration) -> BoxFuture<'a, Result<(), BoxError>> {
+        Box::pin(async move {
+            self.steps.wait().await;
+            self.store.update(registration).await
+        })
+    }
+    fn touch<'a>(&'a self, client_id: &'a str, at: u64) -> BoxFuture<'a, Result<(), BoxError>> {
+        Box::pin(async move {
+            self.steps.wait().await;
+            self.store.touch(client_id, at).await
+        })
+    }
+    fn remove<'a>(&'a self, registration: &'a Registration) -> BoxFuture<'a, Result<(), BoxError>> {
+        Box::pin(async move {
+            self.steps.wait().await;
+            self.store.remove(registration).await
+        })
+    }
+    fn list(&self) -> BoxFuture<'_, Result<Vec<Registration>, BoxError>> {
+        Box::pin(async move {
+            self.steps.wait().await;
+            self.store.list().await
+        })
+    }
+}
+
+/// A pool and store that several servers share, with Claude registered by
+/// a document listing `CLAUDE_CALLBACK`.
+async fn shared_pool() -> (FakeCognito, MemoryStore) {
+    let cognito = FakeCognito::new();
+    let store = MemoryStore::new();
+    let first = sharing(&cognito, &store, &Steps::default(), &[CLAUDE_CALLBACK]);
+    sign_in(&first, &claude(CLAUDE_CALLBACK)).await.unwrap();
+    (cognito, store)
+}
+
+/// Makes Claude's stored document due for a refresh.
+fn due(store: &MemoryStore) {
+    store.edit(CLAUDE, |r| r.fetched_at -= 600);
+}
+
+/// A server on `cognito` and `store` whose calls `steps` holds, fetching
+/// Claude's document with `redirect_uris`.
+fn sharing(cognito: &FakeCognito, store: &MemoryStore, steps: &Steps, redirect_uris: &[&str]) -> Server {
+    let held = Held {
+        cognito: cognito.clone(),
+        store: store.clone(),
+        steps: steps.clone(),
+    };
+    let documents = Documents::default();
+    documents.serve(CLAUDE, &claude_document(redirect_uris));
+    let registrar = Registrar::builder(held.clone(), held)
+        .fetcher(documents.clone())
+        .dynamic_registration()
+        .client_hosts(["claude.ai"])
+        .build()
+        .unwrap();
+    serve(cognito.clone(), store.clone(), documents, registrar)
+}
+
+/// Claude's authorization at `server` with `redirect_uri`, on its own task.
+fn authorize(server: Server, redirect_uri: &'static str) -> JoinHandle<http::Response<String>> {
+    tokio::spawn(async move { get(&server.front, &authorize_url(CLAUDE, redirect_uri, true)).await })
+}
+
+fn stored(store: &MemoryStore) -> Option<Registration> {
+    store.registrations().into_iter().find(|r| r.client_id == CLAUDE)
+}
+
+/// The callback URLs of Claude's app client.
+fn callbacks(cognito: &FakeCognito, store: &MemoryStore) -> Vec<String> {
+    let app_client = stored(store).expect("Claude is registered").app_client;
+    let found = cognito.app_clients().into_iter().find(|c| c.id == app_client);
+    found.map(|c| c.callback_urls).unwrap_or_default()
+}
+
+/// Whether Cognito allows every redirect URI the store lists for Claude:
+/// the check a sign-in meets at managed login after the front sends it on.
+fn allowed(cognito: &FakeCognito, store: &MemoryStore) -> bool {
+    let callbacks = callbacks(cognito, store);
+    stored(store)
+        .unwrap()
+        .redirect_uris
+        .iter()
+        .all(|uri| callbacks.contains(uri))
+}
+
+/// Registers a client on `server`, an app-client write that counts against
+/// the ten a minute it may make, and returns the answer's status.
+async fn register_one(server: &Server) -> StatusCode {
+    let answer = post_json(
+        &server.front,
+        REGISTER,
+        &registration(&["http://127.0.0.1:9000/cb"]),
+    )
+    .await;
+    answer.status()
+}
+
+#[tokio::test]
+async fn a_sign_in_meets_its_redirect_uri_at_cognito_whatever_step_a_refresh_is_at() {
+    for writes_left in [10, 1, 0] {
+        let (cognito, store) = shared_pool().await;
+        let steps = Steps::default();
+        let refreshing = sharing(&cognito, &store, &steps, &[MOVED]);
+        let other = sharing(&cognito, &store, &Steps::default(), &[MOVED]);
+        for _ in writes_left..10 {
+            assert_eq!(register_one(&refreshing).await, StatusCode::CREATED);
+        }
+        // Someone who began signing in before Claude moved its callback is
+        // at managed login while the refresh runs.
+        let answer = get(&other.front, &authorize_url(CLAUDE, CLAUDE_CALLBACK, true)).await;
+        let at_login = location(&answer).unwrap();
+        due(&store);
+
+        steps.hold();
+        let refresh = [authorize(refreshing, MOVED)];
+        while steps.settle(&refresh).await {
+            let arrived = cognito.sign_in(&at_login, "6f1c2e7a-user");
+            assert!(arrived.is_ok(), "{writes_left} writes left: {arrived:?}");
+            // The refresh stored the new callback: a sign-in reads it.
+            if stored(&store).unwrap().redirect_uris == [MOVED] {
+                let signed_in = sign_in(&other, &claude(MOVED)).await;
+                assert!(signed_in.is_ok(), "{writes_left} writes left: {signed_in:?}");
+            }
+            steps.release(&Order::default());
+        }
+        // The sign-in that refreshed goes on to Cognito when a write is left
+        // for the expansion, even with none left for the contraction.
+        let [refresh] = refresh;
+        let expected = if writes_left > 0 {
+            StatusCode::FOUND
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        };
+        assert_eq!(
+            refresh.await.unwrap().status(),
+            expected,
+            "{writes_left} writes left"
+        );
+
+        // Cognito ends with exactly the new list once a refresh with a write
+        // to spare has run.
+        due(&store);
+        let signed_in = sign_in(&other, &claude(MOVED)).await;
+        assert!(signed_in.is_ok(), "{writes_left} writes left: {signed_in:?}");
+        assert_eq!(callbacks(&cognito, &store), [MOVED], "{writes_left} writes left");
+    }
+}
+
+#[tokio::test]
+async fn two_servers_refreshing_a_changed_document_keep_each_stored_redirect_uri_allowed() {
+    let orders = every_order(|order| async move {
+        let (cognito, store) = shared_pool().await;
+        due(&store);
+        let steps = Steps::default();
+        steps.hold();
+        let refreshes = [
+            authorize(sharing(&cognito, &store, &steps, &[MOVED]), MOVED),
+            authorize(sharing(&cognito, &store, &steps, &[MOVED]), MOVED),
+        ];
+        while steps.settle(&refreshes).await {
+            let choices = order.taken();
+            assert!(allowed(&cognito, &store), "choices {choices:?}");
+            steps.release(&order);
+        }
+        assert_eq!(callbacks(&cognito, &store), [MOVED]);
+    })
+    .await;
+    assert!(orders > 1, "{orders}");
+}
+
+#[tokio::test]
+async fn the_next_refresh_repairs_what_crossing_fetches_of_a_changing_document_leave() {
+    // Claude's document changes while two servers refresh it, and their
+    // fetches get different versions. Cognito can then miss a redirect URI
+    // the store lists until the next refresh, which leaves exactly that list.
+    for (a, b) in [(MOVED, MOVED_AGAIN), (MOVED, CLAUDE_CALLBACK)] {
+        let orders = every_order(|order| async move {
+            let (cognito, store) = shared_pool().await;
+            due(&store);
+            let steps = Steps::default();
+            steps.hold();
+            let refreshes = [
+                authorize(sharing(&cognito, &store, &steps, &[a]), a),
+                authorize(sharing(&cognito, &store, &steps, &[b]), b),
+            ];
+            while steps.settle(&refreshes).await {
+                steps.release(&order);
+            }
+            due(&store);
+            let next = sharing(&cognito, &store, &Steps::default(), &[b]);
+            let signed_in = sign_in(&next, &claude(b)).await;
+            let choices = order.taken();
+            assert!(signed_in.is_ok(), "choices {choices:?}: {signed_in:?}");
+            assert_eq!(callbacks(&cognito, &store), [b], "choices {choices:?}");
+        })
+        .await;
+        assert!(orders > 1, "{orders}");
+    }
+}
+
+#[tokio::test]
+async fn a_refresh_leaves_alone_a_registration_made_again_while_it_ran() {
+    for at in 0.. {
+        let (cognito, store) = shared_pool().await;
+        due(&store);
+        store.edit(CLAUDE, |r| r.last_used = Some(1));
+        let steps = Steps::default();
+        let refreshing = sharing(&cognito, &store, &steps, &[MOVED]);
+        let other = sharing(&cognito, &store, &Steps::default(), &[MOVED_AGAIN]);
+        steps.hold();
+        let refresh = [authorize(refreshing, MOVED)];
+        let mut step = 0;
+        while steps.settle(&refresh).await {
+            if step == at {
+                // Cleanup removes the idle registration and deletes its app
+                // client, and the next sign-in registers Claude again.
+                assert_eq!(other.registrar.cleanup().await.unwrap().idle, 1);
+                sign_in(&other, &claude(MOVED_AGAIN)).await.unwrap();
+            }
+            step += 1;
+            steps.release(&Order::default());
+        }
+        if step <= at {
+            break;
+        }
+        assert_eq!(
+            stored(&store).unwrap().redirect_uris,
+            [MOVED_AGAIN],
+            "held at call {at}"
+        );
+        assert_eq!(callbacks(&cognito, &store), [MOVED_AGAIN], "held at call {at}");
+        let signed_in = sign_in(&other, &claude(MOVED_AGAIN)).await;
+        assert!(signed_in.is_ok(), "held at call {at}: {signed_in:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_document_due_for_a_refresh_signs_in_with_no_app_client_writes_left() {
+    let server = open_server();
+    server
+        .documents
+        .serve(CLAUDE, &claude_document(&[CLAUDE_CALLBACK]));
+    sign_in(&server, &claude(CLAUDE_CALLBACK)).await.unwrap();
+    while register_one(&server).await == StatusCode::CREATED {}
+    due(&server.store);
+    let fetches = server.documents.fetches();
+    let signed_in = sign_in(&server, &claude(CLAUDE_CALLBACK)).await;
+    assert!(signed_in.is_ok(), "{signed_in:?}");
+    assert_eq!(server.documents.fetches(), fetches + 1, "refreshed");
 }

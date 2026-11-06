@@ -141,8 +141,8 @@ pub enum AdminError {
     Other(#[source] Arc<BoxError>),
 }
 
-/// The Cognito API the [`Registrar`] needs: creating, changing and deleting
-/// the app clients it owns.
+/// The Cognito API the [`Registrar`] needs: creating, reading, changing and
+/// deleting the app clients it owns.
 ///
 /// `CognitoApi` implements it over the AWS SDK. The test kit's
 /// `FakeCognito` implements it in memory.
@@ -155,6 +155,8 @@ pub trait AppClients: Send + Sync + 'static {
         name: &'a str,
         callback_urls: &'a [String],
     ) -> BoxFuture<'a, Result<ClientId, AdminError>>;
+    /// The app client's callback URLs.
+    fn callback_urls<'a>(&'a self, client: &'a ClientId) -> BoxFuture<'a, Result<Vec<String>, AdminError>>;
     /// Replaces the app client's callback URLs and keeps its other settings.
     fn set_callback_urls<'a>(
         &'a self,
@@ -656,26 +658,67 @@ impl Registrar {
         };
         let metadata = document::parse(url, &body).map_err(RegistrationError::InvalidClient)?;
         let metadata = self.trusted_uris(metadata)?;
-        let Some(mut registration) = stored else {
+        let Some(stored) = stored else {
             return self.create_document(url, metadata, relay).await;
         };
-        let after = callbacks(&metadata.redirect_uris, relay);
-        if callbacks(&registration.redirect_uris, relay) != after {
+        // Expand before the store can hold the new list. Cognito allows it,
+        // the stored list, and what it allows already, which can be another
+        // refresh's expansion. So whichever list a sign-in reads from the
+        // store, Cognito allows it.
+        let allowed: BTreeSet<String> = self
+            .inner
+            .app_clients
+            .callback_urls(&stored.app_client)
+            .await?
+            .into_iter()
+            .collect();
+        let new = callbacks(&metadata.redirect_uris, relay);
+        let old = callbacks(&stored.redirect_uris, relay);
+        let wanted: BTreeSet<String> = allowed.iter().chain(&old).chain(&new).cloned().collect();
+        if wanted != allowed {
             self.write()?;
+            let wanted: Vec<String> = wanted.iter().cloned().collect();
             self.inner
                 .app_clients
-                .set_callback_urls(&registration.app_client, &after)
+                .set_callback_urls(&stored.app_client, &wanted)
                 .await?;
         }
-        registration.redirect_uris = metadata.redirect_uris;
-        registration.client_name = metadata.client_name;
-        registration.fetched_at = now;
+        let registration = Registration {
+            redirect_uris: metadata.redirect_uris,
+            client_name: metadata.client_name,
+            fetched_at: now,
+            ..stored
+        };
         self.inner
             .store
             .update(&registration)
             .await
             .map_err(unavailable)?;
-        Ok(registration)
+        if wanted.iter().all(|url| new.contains(url)) {
+            return Ok(registration);
+        }
+        // Contract to the new list, but only while the store still holds it.
+        // A refresh that stored another list since expanded for it first.
+        // With no write to spare, or a refused one, Cognito keeps a superset
+        // for the next refresh to contract.
+        let current = self
+            .inner
+            .store
+            .get(url.as_str())
+            .await
+            .map_err(unavailable)?
+            .ok_or_else(|| unavailable("the registration was removed during its refresh".into()))?;
+        if current.app_client == registration.app_client
+            && current.redirect_uris == registration.redirect_uris
+            && self.write().is_ok()
+        {
+            let _ = self
+                .inner
+                .app_clients
+                .set_callback_urls(&current.app_client, &new)
+                .await;
+        }
+        Ok(current)
     }
 
     /// Keeps the redirect URIs a code may be sent to, and refuses a

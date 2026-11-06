@@ -237,6 +237,10 @@ impl AppClients for CognitoApi {
         Box::pin(self.create_client(name, callback_urls))
     }
 
+    fn callback_urls<'a>(&'a self, client: &'a ClientId) -> BoxFuture<'a, Result<Vec<String>, AdminError>> {
+        Box::pin(async move { Ok(self.describe(client).await?.callback_urls.unwrap_or_default()) })
+    }
+
     fn set_callback_urls<'a>(
         &'a self,
         client: &'a ClientId,

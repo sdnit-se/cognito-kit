@@ -160,6 +160,23 @@ minute, when a client asks for a redirect URI that the stored document
 doesn't list. If the host is down, a document that was valid before stays
 in use.
 
+When a fetched document lists other redirect URIs than the stored one, the
+registrar changes the app client in two steps around the store write.
+Before it stores the new list, it adds the new callback URLs to those the
+app client has. After, it removes the ones the document dropped, unless
+another refresh has stored a newer list since. So a sign-in that read
+either list from the store finds its callback URL on the app client. Each
+refresh also reads the app client's callback URLs and adds any that the
+stored document lists and the app client lacks.
+
+Two limits remain. Managed login can take minutes to accept a callback
+URL added to an existing app client, as the section above says, so a web
+client's new https redirect URI can get `redirect_mismatch` at managed
+login for that long. And if two servers refresh one document while it
+changes, and their fetches get different versions, the app client can
+miss a callback URL the store lists until the next refresh, at most five
+minutes later.
+
 To fetch through your own egress, implement
 [`FetchDocument`](crate::registration::FetchDocument) and pass it to
 [`fetcher`](crate::registration::RegistrarBuilder::fetcher). It must refuse
@@ -180,7 +197,10 @@ working.
 
 Cognito allows five app-client changes per second per pool, shared with
 every other caller. Each registrar makes at most ten a minute on behalf
-of requests, and answers 503 above that. Build one per process. Behind
+of requests, and answers 503 above that. A refresh that finds a
+document's redirect URIs changed makes two, and if none is left for the
+second, the app client keeps the old callback URLs as well until a later
+refresh removes them. Build one per process. Behind
 several instances, that is ten per instance, so also put a rate rule, such
 as an AWS WAF rule, in front of `/oauth2/authorize` and `/oauth2/register`.
 

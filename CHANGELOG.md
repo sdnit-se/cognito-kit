@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+- **A client that changes its redirect URIs keeps signing in.** When a
+  metadata document's `redirect_uris` change, a refresh adds the new
+  callback URLs to the app client before it stores the document, and
+  removes the dropped ones after, only while the store still holds that
+  list. A sign-in that read either list finds its callback URL on the app
+  client. Before, a refresh replaced the callback URLs first, and two
+  refreshes at once could leave the store listing a URI that the app
+  client lacked until the document changed again (#6).
+- Every refresh reads the app client's callback URLs, one
+  `DescribeUserPoolClient`, and adds any that the stored document lists
+  and the app client lacks, so a mismatch lasts at most until the next
+  refresh. If Cognito doesn't answer, that sign-in gets 503 and the next
+  one refreshes again. A refresh that changes nothing makes no app-client
+  write. One that changes the list makes two. If the second finds the
+  minute's writes spent, the app client keeps the old callback URLs as
+  well until a later refresh removes them.
+- **Breaking:** `AppClients` has a new method, `callback_urls`. `CognitoApi`
+  and `FakeCognito` implement it. If you implement `AppClients` yourself,
+  add it.
+
 ## 0.3.1 (2026-11-05)
 
 - `FakeCognito`'s ID tokens carry the sign-in's nonce, as Cognito's do, so
