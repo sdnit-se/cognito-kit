@@ -16,14 +16,22 @@ const scripted: Check[] = [
   ['reused refresh token refused', (f) => f.reusedRefreshToken === 'invalid_grant'],
 ];
 
-const codex: Check[] = [
+/// Codex logs in by its metadata document, whose URL is its client_id, or
+/// by registering, which gives it the app client's id.
+const codex = (byDocument: boolean): Check[] => [
   ['login done', (f) => f.exit === 0],
+  [byDocument ? 'client_id is the document URL' : 'client_id is the registered one', (f) => f.clientIdIsUrl === byDocument],
   ['credentials stored', (f) => f.stored === true],
   ['MCP 200', (f) => f.mcp === 200],
 ];
 
 const expected: [path: string, checks: Check[]][] = [
-  ['discovery', [['MCP 401 without a token', (d) => d.status === 401]]],
+  ['discovery', [
+    ['MCP 401 without a token', (d) => d.status === 401],
+    ['metadata documents advertised', (d) => d.cimd === true],
+    ['registration endpoint advertised', (d) => typeof d.registration === 'string' && d.registration.endsWith('/oauth2/register')],
+    ['PKCE with S256 alone', (d) => JSON.stringify(d.pkce) === '["S256"]'],
+  ]],
   ['claudeCodeByDocument.0', scripted],
   ['claudeCodeByDocument.1', scripted],
   ['claudeCodeAfterChange', [
@@ -31,10 +39,17 @@ const expected: [path: string, checks: Check[]][] = [
     ['refresh stored the fetched document', (f) => f.refreshed === true],
     ['callbacks back to the relay alone', (f) => f.callbacks?.length === 1 && f.callbacks[0].endsWith('/oauth2/callback')],
   ]],
-  ['claudeCodeByRegistration', [['registered 201', (r) => r.registered === 201]]],
+  ['claudeCodeWhileLeased', [
+    ...scripted,
+    ['the stored document served while another server held the lease', (f) => f.leaseKept === true && f.refreshed === false],
+  ]],
+  ['claudeCodeByRegistration', [
+    ['registered 201', (r) => r.registered === 201],
+    ['registered as a public client', (r) => r.method === 'none'],
+  ]],
   ['claudeCodeByRegistration.flow', scripted],
-  ['codexBycimd', codex],
-  ['codexBydcr', codex],
+  ['codexBycimd', codex(true)],
+  ['codexBydcr', codex(false)],
 ];
 
 /// Each flow and check that the report misses.

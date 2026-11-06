@@ -2,7 +2,8 @@
 // Code's metadata document and its Dynamic Client Registration, scripted as
 // Claude Code does them, then the real Codex CLI by document and by
 // registration. Between them, it changes Claude Code's stored document in
-// the table so that the next sign-in refreshes it. Prints what it saw as
+// the table so that the next sign-in refreshes it, and then plants another
+// server's lease on it so that the next one doesn't. Prints what it saw as
 // JSON and never prints a token or the password, then fails on each outcome
 // that outcomes.ts expects and a flow missed.
 //
@@ -192,6 +193,24 @@ try {
       callbacks: aws('cognito-idp', 'describe-user-pool-client', '--user-pool-id', POOL,
         '--client-id', flow.access.client_id, '--query', 'UserPoolClient.CallbackURLs'),
     };
+  });
+
+  // Claude Code by its document again, due, while another server holds the
+  // lease on its registration. The sign-in goes on with the stored
+  // document, and leaves the refresh to that server.
+  report.claudeCodeWhileLeased = await attempt(async () => {
+    const key = JSON.stringify({ pk: { S: `client#${CLAUDE_CODE}` } });
+    const until = Math.floor(Date.now() / 1000) + 120;
+    aws('dynamodb', 'update-item', '--table-name', TABLE, '--key', key,
+      '--update-expression', 'SET lease_owner = :owner, lease_until = :until, fetched_at = :due',
+      '--expression-attribute-values', JSON.stringify({ ':owner': { S: 'live-test' }, ':until': { N: String(until) }, ':due': { N: '0' } }));
+    try {
+      const flow = await claudeCode(CLAUDE_CODE, `http://localhost:${port()}/callback`, asm, prm);
+      const item = aws('dynamodb', 'get-item', '--table-name', TABLE, '--key', key, '--consistent-read').Item;
+      return { ...flow, leaseKept: item.lease_owner?.S === 'live-test', refreshed: Number(item.fetched_at.N) > 0 };
+    } finally {
+      aws('dynamodb', 'update-item', '--table-name', TABLE, '--key', key, '--update-expression', 'REMOVE lease_owner, lease_until');
+    }
   });
 
   // Claude Code by Dynamic Client Registration, as when a server offers no documents.
