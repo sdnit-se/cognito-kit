@@ -434,7 +434,9 @@ mod registration {
     use super::FakeCognito;
     use crate::config::ClientId;
     use crate::http_client::BoxError;
-    use crate::registration::{AdminError, AppClients, BoxFuture, Lease, Registration, RegistrationStore};
+    use crate::registration::{
+        AdminError, AppClients, BoxFuture, Lease, Leased, Registration, RegistrationStore,
+    };
 
     impl AppClients for FakeCognito {
         fn create<'a>(
@@ -603,14 +605,16 @@ mod registration {
             client_id: &'a str,
             lease: &'a Lease,
             now: u64,
-        ) -> BoxFuture<'a, Result<Option<Registration>, BoxError>> {
+        ) -> BoxFuture<'a, Result<Option<Leased>, BoxError>> {
             let mut memory = self.0.lock().unwrap();
-            let free = memory.leases.get(client_id).is_none_or(|held| held.until <= now);
-            let leased = memory.registrations.get(client_id).filter(|_| free).cloned();
-            if leased.is_some() {
-                memory.leases.insert(client_id.to_owned(), lease.clone());
+            let Some(registration) = memory.registrations.get(client_id).cloned() else {
+                return ready(Ok(None));
+            };
+            if memory.leases.get(client_id).is_some_and(|held| held.until > now) {
+                return ready(Ok(Some(Leased::Held(registration))));
             }
-            ready(Ok(leased))
+            memory.leases.insert(client_id.to_owned(), lease.clone());
+            ready(Ok(Some(Leased::Taken(registration))))
         }
 
         fn update<'a>(

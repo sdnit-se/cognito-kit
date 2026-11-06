@@ -127,6 +127,18 @@ impl Lease {
     }
 }
 
+/// What [`RegistrationStore::lease`] found: the registration as stored at
+/// that moment, and whether the lease is the caller's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Leased {
+    /// The caller has the lease.
+    Taken(Registration),
+    /// Another lease lasts past `now`, and that refresh may still change
+    /// the registration.
+    Held(Registration),
+}
+
 /// Keeps the [`Registrar`]'s registrations: which `client_id` maps to which
 /// app client. Every server instance must share one store.
 ///
@@ -147,15 +159,15 @@ pub trait RegistrationStore: Send + Sync + 'static {
     fn insert(&self, registration: Registration) -> BoxFuture<'_, Result<Registration, BoxError>>;
     /// Gives the registration for `client_id` to `lease`, unless another
     /// lease on it lasts past `now`, and returns the registration as stored
-    /// at that moment. `None` if another lease holds it, or there is no
-    /// registration. Must be one conditional write, so that of two callers
-    /// at once only one gets the lease.
+    /// at that moment, either way. `None` if there is no registration. Must
+    /// be one conditional write, so that of two callers at once only one
+    /// gets the lease.
     fn lease<'a>(
         &'a self,
         client_id: &'a str,
         lease: &'a Lease,
         now: u64,
-    ) -> BoxFuture<'a, Result<Option<Registration>, BoxError>>;
+    ) -> BoxFuture<'a, Result<Option<Leased>, BoxError>>;
     /// Replaces the stored `redirect_uris`, `client_name` and `fetched_at`
     /// if the registration's lease is still `lease`, by its owner, and
     /// returns whether it did. A lease that ran out still counts until
@@ -300,6 +312,30 @@ enum Removal {
     Untrusted,
     Unused,
     Idle,
+}
+
+/// Why a refresh under a lease stopped.
+enum Stopped {
+    /// The registration is no longer the leased one: cleanup removed it, or
+    /// a refresh that took over the lease changed it.
+    Lost,
+    /// Cognito, the store or the write budget refused.
+    Refused(RegistrationError),
+}
+
+impl From<AdminError> for Stopped {
+    fn from(error: AdminError) -> Self {
+        match error {
+            AdminError::NotFound => Self::Lost,
+            error => Self::Refused(error.into()),
+        }
+    }
+}
+
+impl From<RegistrationError> for Stopped {
+    fn from(error: RegistrationError) -> Self {
+        Self::Refused(error)
+    }
 }
 
 /// Registers clients that bring their own identity, and maps each to a
@@ -699,10 +735,12 @@ impl Registrar {
             )));
         }
         let stored = self.inner.store.get(url.as_str()).await.map_err(unavailable)?;
-        let now = now();
+        // When this sign-in's fetch begins: what its refresh stores as
+        // `fetched_at`.
+        let started = now();
         let lists = |uris: &[String]| redirect::find(uris, redirect_uri).is_some();
         if let Some(stored) = &stored {
-            let age = now.saturating_sub(stored.fetched_at);
+            let age = started.saturating_sub(stored.fetched_at);
             if age < REFRESH.as_secs() && (lists(&stored.redirect_uris) || age < MIN_REFETCH.as_secs()) {
                 return Ok(stored.clone());
             }
@@ -711,51 +749,63 @@ impl Registrar {
             let metadata = document::parse(url, &body).map_err(RegistrationError::InvalidClient)?;
             self.trusted_uris(metadata)
         };
-        let fetched = fetcher.fetch(url.url()).await;
-        let Some(stored) = stored else {
-            let metadata = parse(fetched.map_err(RegistrationError::Fetch)?)?;
-            return self.create_document(url, metadata, relay).await;
-        };
-        let metadata = match fetched {
-            Ok(body) => Some(parse(body)?),
+        let metadata = match fetcher.fetch(url.url()).await {
+            Ok(body) => Ok(parse(body)?),
             // A document that was valid stays usable while its host is
             // down, and the refresh below brings Cognito to its stored list.
-            Err(error) if error.is_transient() => None,
+            Err(error) if error.is_transient() && stored.is_some() => Err(error),
             Err(error) => return Err(RegistrationError::Fetch(error)),
         };
-        let host_down = metadata.is_none();
 
         // Refreshes take turns, also across processes. Cognito can't make a
         // write conditional, so two refreshes of one document at once could
-        // cross.
-        let lease = Lease::new(owner(), now + LEASE.as_secs());
-        let leased = self
-            .inner
-            .store
-            .lease(url.as_str(), &lease, now)
-            .await
-            .map_err(unavailable)?;
-        let Some(leased) = leased else {
+        // cross. The fetch can take a while, so from here on the refresh
+        // goes by the registration as the lease finds it.
+        let at = now();
+        let lease = Lease::new(owner(), at + LEASE.as_secs());
+        let leased = match stored {
+            Some(_) => self
+                .inner
+                .store
+                .lease(url.as_str(), &lease, at)
+                .await
+                .map_err(unavailable)?,
+            None => None,
+        };
+        let leased = match leased {
+            Some(Leased::Taken(leased)) => leased,
             // Cognito allows every list the store holds while a refresh
             // runs. A redirect URI that only the fetched document lists
             // waits for that refresh to store it.
-            let new = metadata.as_ref().is_some_and(|m| lists(&m.redirect_uris));
-            return if new && !lists(&stored.redirect_uris) {
-                Err(RegistrationError::Busy)
-            } else {
-                Ok(stored)
-            };
+            Some(Leased::Held(current)) => {
+                let new = metadata.as_ref().is_ok_and(|m| lists(&m.redirect_uris));
+                return if new && !lists(&current.redirect_uris) {
+                    Err(RegistrationError::Busy)
+                } else {
+                    Ok(current)
+                };
+            }
+            // Never registered, or removed by cleanup during the fetch.
+            None => {
+                let metadata = metadata.map_err(RegistrationError::Fetch)?;
+                return self.create_document(url, metadata, relay).await;
+            }
         };
+        // A fetch replaces the stored document only if it began after the
+        // stored one's, since a slow fetch may have read the document before
+        // another refresh stored a newer copy. Otherwise, as while the host
+        // is down, the refresh brings Cognito to the stored list.
+        let registration = match metadata {
+            Ok(metadata) if leased.fetched_at < started => Registration {
+                redirect_uris: metadata.redirect_uris,
+                client_name: metadata.client_name,
+                fetched_at: started,
+                ..leased.clone()
+            },
+            _ => leased.clone(),
+        };
+        let repair = registration == leased;
         let refreshed = async {
-            let registration = match metadata {
-                Some(metadata) => Registration {
-                    redirect_uris: metadata.redirect_uris,
-                    client_name: metadata.client_name,
-                    fetched_at: now,
-                    ..leased.clone()
-                },
-                None => leased.clone(),
-            };
             let old = callbacks(&leased.redirect_uris, relay);
             let new = callbacks(&registration.redirect_uris, relay);
             let allowed: BTreeSet<String> = self
@@ -791,7 +841,7 @@ impl Registrar {
                 .await
                 .map_err(unavailable)?;
             if !landed {
-                return Err(unavailable("another refresh took the registration over".into()));
+                return Err(Stopped::Lost);
             }
             // Contract. With no write to spare, or a refused one, Cognito
             // keeps a superset for the next refresh to contract.
@@ -807,8 +857,13 @@ impl Registrar {
         .await;
         let _ = self.inner.store.release(url.as_str(), &lease).await;
         match refreshed {
-            Err(_) if host_down => Ok(leased),
-            refreshed => refreshed,
+            Ok(registration) => Ok(registration),
+            // A refused repair leaves the registration as leased.
+            Err(Stopped::Refused(_)) if repair => Ok(leased),
+            Err(Stopped::Refused(error)) => Err(error),
+            Err(Stopped::Lost) => Err(unavailable(
+                "cleanup or another refresh took the registration".into(),
+            )),
         }
     }
 

@@ -3,9 +3,12 @@ use std::collections::HashMap;
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
-use aws_sdk_dynamodb::types::{AttributeValue, Delete, Put, ReturnValue, TransactWriteItem};
+use aws_sdk_dynamodb::operation::update_item::UpdateItemError;
+use aws_sdk_dynamodb::types::{
+    AttributeValue, Delete, Put, ReturnValue, ReturnValuesOnConditionCheckFailure, TransactWriteItem,
+};
 
-use super::{BoxFuture, Lease, Registration, RegistrationKind, RegistrationStore};
+use super::{BoxFuture, Lease, Leased, Registration, RegistrationKind, RegistrationStore};
 use crate::config::ClientId;
 use crate::http_client::BoxError;
 
@@ -94,12 +97,7 @@ impl DynamoStore {
         }
     }
 
-    async fn lease(
-        &self,
-        client_id: &str,
-        lease: &Lease,
-        now: u64,
-    ) -> Result<Option<Registration>, BoxError> {
+    async fn lease(&self, client_id: &str, lease: &Lease, now: u64) -> Result<Option<Leased>, BoxError> {
         let leased = self
             .client
             .update_item()
@@ -113,12 +111,22 @@ impl DynamoStore {
             .expression_attribute_values(":until", AttributeValue::N(lease.until.to_string()))
             .expression_attribute_values(":now", AttributeValue::N(now.to_string()))
             .return_values(ReturnValue::AllNew)
+            .return_values_on_condition_check_failure(ReturnValuesOnConditionCheckFailure::AllOld)
             .send()
             .await;
         match leased {
-            Ok(output) => output.attributes.map(|item| registration(&item)).transpose(),
-            Err(error) if refused(&error) => Ok(None),
-            Err(error) => Err(error.into()),
+            Ok(output) => output
+                .attributes
+                .map(|item| registration(&item).map(Leased::Taken))
+                .transpose(),
+            // Another lease holds the item, or there is no item to return.
+            Err(error) => match error.as_service_error() {
+                Some(UpdateItemError::ConditionalCheckFailedException(refused)) => refused
+                    .item()
+                    .map(|item| registration(item).map(Leased::Held))
+                    .transpose(),
+                _ => Err(error.into()),
+            },
         }
     }
 
@@ -373,7 +381,7 @@ impl RegistrationStore for DynamoStore {
         client_id: &'a str,
         lease: &'a Lease,
         now: u64,
-    ) -> BoxFuture<'a, Result<Option<Registration>, BoxError>> {
+    ) -> BoxFuture<'a, Result<Option<Leased>, BoxError>> {
         Box::pin(self.lease(client_id, lease, now))
     }
 

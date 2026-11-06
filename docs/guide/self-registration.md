@@ -160,11 +160,15 @@ minute, when a client asks for a redirect URI that the stored document
 doesn't list. If the host is down, a document that was valid before stays
 in use.
 
-A refresh takes a lease on the registration in the store first, so that
-refreshes of one document take turns, also across servers. Cognito can't
-make a change conditional, so two refreshes at once could otherwise leave
-the app client without a callback URL that the store lists. While the
-lease is held, the registrar:
+Once its fetch is done, a refresh takes a lease on the registration in
+the store, so that refreshes of one document take turns, also across
+servers. Cognito can't make a change conditional, so two refreshes at once
+could otherwise leave the app client without a callback URL that the store
+lists. Taking the lease returns the registration as stored then, and the
+refresh goes by that copy, since another refresh may have stored a newer
+document during the fetch, or cleanup may have removed the registration.
+A fetched document replaces the stored one only if its fetch began after
+the stored one's. While the lease is held, the registrar:
 
 1. Reads the app client's callback URLs. If they lack a URL of the stored
    list or of the fetched one, it adds them.
@@ -177,9 +181,10 @@ the stored list, which repairs an app client that lacks one of its
 callback URLs.
 
 While another server holds the lease, a sign-in with a redirect URI that
-the store lists goes on as usual. One with a URI that only the new
-document lists gets a 503 and can try again a moment later. A lease lasts
-30 seconds, longer than a refresh takes. A server that stops mid-refresh
+the store lists then goes on as usual, through the app client the store
+names then. One with a URI that only the new document lists gets a 503 and
+can try again a moment later. A lease lasts 30 seconds from when it is
+taken, longer than a refresh takes. A server that stops mid-refresh
 leaves its lease to run out, and a refresh whose lease ran out and was
 taken over stops at its store write. A refresh's Cognito writes can't be
 made conditional, so it must make them within 30 seconds of taking the
@@ -282,8 +287,9 @@ one instance is known on all of them.
   [`Registration`](crate::registration::Registration) serializes to JSON.
   `insert` must keep the first registration for a `client_id` and return
   it to the second writer, because two servers can register one client at
-  once. `lease` must be one conditional write that also returns the
-  registration, and `update` and `release` must check the lease's owner,
+  once. `lease` must be one conditional write that returns the
+  registration as stored, whether or not the caller got the lease, and
+  `update` and `release` must check the lease's owner,
   because two servers can refresh one document at once.
 
 [`Registrar`]: crate::registration::Registrar

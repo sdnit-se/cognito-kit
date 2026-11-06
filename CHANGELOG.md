@@ -16,6 +16,15 @@
   gets 503. A lease runs out after 30 seconds, so a server that stops
   mid-refresh holds the document back no longer than that. A refresh whose
   lease ran out and was taken over doesn't store its fetch.
+- A refresh goes by the registration as taking the lease finds it, not as
+  read before the fetch. A fetched document replaces the stored one only
+  if its fetch began after the stored one's, so a slow fetch can't undo a
+  newer refresh, or a registration that a sign-in made again after
+  cleanup. A sign-in that finds another server's lease goes on with the
+  registration as stored then, and one that finds it removed registers
+  the document again. A refresh that finds the app client gone answers
+  503, also while the host is down. The lease's 30 seconds count from when
+  it is taken, after the fetch.
 - Every refresh reads the app client's callback URLs, one
   `DescribeUserPoolClient`, and sets them to the stored list if they
   differ, also while the document's host is down. So an app client that
@@ -30,12 +39,15 @@
   gets the fetched list before the store does, as before this release.
 - `FakeCognito` refuses more than 100 callback URLs on an app client, as
   Cognito does.
-- **Breaking:** `RegistrationStore` has two new methods, `lease` and
-  `release`, and `update` takes the `Lease` and returns whether it stored
-  the registration. `DynamoStore` keeps the lease in two attributes of the
-  registration's item, with the `UpdateItem` permission it already needed.
+- **Breaking:** `RegistrationStore` has two new methods, `lease`, which
+  returns the registration as stored and whether the caller got the lease
+  (`Leased`), and `release`. `update` takes the `Lease` and returns whether
+  it stored the registration. `DynamoStore` keeps the lease in two
+  attributes of the registration's item, with the `UpdateItem` permission
+  it already needed, and reads a refused lease's item from the refusal.
   `MemoryStore` implements them too. If you implement `RegistrationStore`
-  yourself, make `lease` one conditional write, as its docs say.
+  yourself, make `lease` one conditional write that returns the
+  registration either way, as its docs say.
 - **Breaking:** `AppClients` has a new method, `callback_urls`. `CognitoApi`
   and `FakeCognito` implement it. If you implement `AppClients` yourself,
   add it.
