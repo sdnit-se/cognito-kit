@@ -806,7 +806,7 @@ impl Registrar {
             _ => leased.clone(),
         };
         // Past Cognito's limit, Cognito holds the new list alone once it has
-        // it, so a refresh that stops after that serves the new list.
+        // it, while the store may still hold the old one.
         let mut narrowed = false;
         let refreshed = async {
             let old = callbacks(&leased.redirect_uris, relay);
@@ -822,8 +822,11 @@ impl Registrar {
             // list a sign-in reads from the store, Cognito allows it. Past
             // Cognito's limit, Cognito gets the new list alone, and still
             // before the store, so that only a redirect URI the document
-            // dropped is refused meanwhile.
+            // dropped is refused meanwhile. A callback on a host this server
+            // no longer trusts goes now: the front refuses it already, and
+            // once the store forgets it only Cognito would still allow it.
             let mut wanted: BTreeSet<String> = allowed.iter().chain(&old).chain(&new).cloned().collect();
+            wanted.retain(|url| url == relay || self.trusted(url));
             let over = wanted.len() > MAX_CALLBACKS;
             if over {
                 wanted = new.iter().cloned().collect();
@@ -850,12 +853,16 @@ impl Registrar {
             }
             // Contract. With no write to spare, or a refused one, Cognito
             // keeps a superset for the next refresh to contract.
-            if wanted.iter().any(|url| !new.contains(url)) && self.write().is_ok() {
-                let _ = self
+            // Cleanup may have deleted the app client since the store write.
+            if wanted.iter().any(|url| !new.contains(url))
+                && self.write().is_ok()
+                && let Err(AdminError::NotFound) = self
                     .inner
                     .app_clients
                     .set_callback_urls(&leased.app_client, &new)
-                    .await;
+                    .await
+            {
+                return Err(Stopped::Lost);
             }
             Ok(())
         }
@@ -863,7 +870,25 @@ impl Registrar {
         let _ = self.inner.store.release(url.as_str(), &lease).await;
         match refreshed {
             Ok(()) => Ok(registration),
-            Err(Stopped::Refused(error)) => as_stored(if narrowed { registration } else { leased }, error),
+            // Cognito holds the new list and the store the old, so a sign-in
+            // goes on only with a redirect URI both list: token redemption
+            // reads the store.
+            Err(Stopped::Refused(error)) if narrowed => {
+                let both = leased
+                    .redirect_uris
+                    .iter()
+                    .filter(|uri| registration.redirect_uris.contains(uri))
+                    .cloned()
+                    .collect();
+                as_stored(
+                    Registration {
+                        redirect_uris: both,
+                        ..leased
+                    },
+                    error,
+                )
+            }
+            Err(Stopped::Refused(error)) => as_stored(leased, error),
             Err(Stopped::Lost) => Err(unavailable(
                 "cleanup or another refresh took the registration".into(),
             )),

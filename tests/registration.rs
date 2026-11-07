@@ -1449,7 +1449,7 @@ fn uris(uris: &[String]) -> Vec<&str> {
 }
 
 #[tokio::test]
-async fn at_cognitos_limit_a_swap_the_store_misses_sends_on_only_what_cognito_allows() {
+async fn at_cognitos_limit_a_swap_the_store_misses_sends_on_only_what_cognito_and_the_store_list() {
     let old: Vec<String> = (0..100)
         .map(|i| format!("https://claude.ai/callback/{i}"))
         .collect();
@@ -1463,12 +1463,72 @@ async fn at_cognitos_limit_a_swap_the_store_misses_sends_on_only_what_cognito_al
     steps.fail("update");
     let server = sharing(&cognito, &store, &steps, &uris(&new));
     // Cognito gets the new list alone before the store, which fails.
-    let dropped = get(&server.front, &authorize_url(CLAUDE, &old[99], true)).await;
-    assert_eq!(location(&dropped), None, "the dropped URI is never sent on");
-    for uri in [&old[0], &new[99]] {
-        let signed_in = sign_in(&server, &claude(uri)).await;
-        assert!(signed_in.is_ok(), "{uri}: {signed_in:?}");
+    // Cognito no longer allows the dropped URI, and token redemption reads
+    // the store, which doesn't list the added one yet.
+    for uri in [&old[99], &new[99]] {
+        let answer = get(&server.front, &authorize_url(CLAUDE, uri, true)).await;
+        assert_eq!(location(&answer), None, "{uri} is never sent on");
     }
+    let signed_in = sign_in(&server, &claude(&old[0])).await;
+    assert!(signed_in.is_ok(), "{signed_in:?}");
+}
+
+#[tokio::test]
+async fn a_refresh_never_leaves_a_host_no_longer_trusted_in_cognito_alone() {
+    const CHATGPT_CALLBACK: &str = "https://chatgpt.com/connector/oauth/callback";
+    let (cognito, store, documents) = (FakeCognito::new(), MemoryStore::new(), Documents::default());
+    documents.serve(CLAUDE, &claude_document(&[CLAUDE_CALLBACK, CHATGPT_CALLBACK]));
+    let trusting = |hosts: &[&'static str]| {
+        let registrar = Registrar::builder(cognito.clone(), store.clone())
+            .fetcher(documents.clone())
+            .dynamic_registration()
+            .client_hosts(hosts.to_vec())
+            .build()
+            .unwrap();
+        serve(cognito.clone(), store.clone(), documents.clone(), registrar)
+    };
+    sign_in(&trusting(&["claude.ai", "chatgpt.com"]), &claude(CLAUDE_CALLBACK))
+        .await
+        .unwrap();
+
+    // The operator stops trusting chatgpt.com, and the minute's app-client
+    // writes run out before the next refresh.
+    let server = trusting(&["claude.ai"]);
+    while register_one(&server).await == StatusCode::CREATED {}
+    due(&store);
+    let _ = sign_in(&server, &claude(CLAUDE_CALLBACK)).await;
+    // Cleanup removes a registration whose stored document names the host.
+    trusting(&["claude.ai"]).registrar.cleanup().await.unwrap();
+    let kept: Vec<String> = cognito
+        .app_clients()
+        .into_iter()
+        .flat_map(|c| c.callback_urls)
+        .collect();
+    assert!(!kept.iter().any(|c| c == CHATGPT_CALLBACK), "{kept:?}");
+}
+
+#[tokio::test]
+async fn a_sign_in_is_not_sent_through_an_app_client_cleanup_deleted_before_the_refresh_contracted() {
+    let (cognito, store) = (FakeCognito::new(), MemoryStore::new());
+    let first = sharing(&cognito, &store, &Steps::default(), &[CLAUDE_CALLBACK, MOVED]);
+    sign_in(&first, &claude(CLAUDE_CALLBACK)).await.unwrap();
+    due(&store);
+    store.edit(CLAUDE, |r| r.last_used = Some(1));
+    let steps = Steps::default();
+    let server = sharing(&cognito, &store, &steps, &[CLAUDE_CALLBACK]);
+    steps.hold();
+    // Dropping MOVED needs no expansion, so the one Cognito write is the
+    // contraction, after the store write.
+    let refresh = [authorize(server, CLAUDE_CALLBACK)];
+    steps.run_to(&refresh, "set_callback_urls").await;
+
+    let other = sharing(&cognito, &store, &Steps::default(), &[CLAUDE_CALLBACK]);
+    assert_eq!(other.registrar.cleanup().await.unwrap().idle, 1);
+    steps.run_out(&refresh).await;
+    let [refresh] = refresh;
+    let answer = refresh.await.unwrap();
+    assert_eq!(answer.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(location(&answer), None);
 }
 
 #[tokio::test]

@@ -224,9 +224,10 @@ working.
 Cognito allows five app-client changes per second per pool, shared with
 every other caller. Each registrar makes at most ten a minute on behalf
 of requests, and answers 503 above that. A refresh that finds a
-document's redirect URIs changed makes two. If none is left for the
-second, the app client keeps the old callback URLs as well until a later
-refresh removes them. Build one per process. Behind
+document's redirect URIs changed makes up to two: one to add callback
+URLs and one to remove them. If none is left for the removal, the app
+client keeps the old callback URLs as well until a later refresh removes
+them. Build one per process. Behind
 several instances, that is ten per instance, so also put a rate rule, such
 as an AWS WAF rule, in front of `/oauth2/authorize` and `/oauth2/register`.
 

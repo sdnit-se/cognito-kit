@@ -34,9 +34,11 @@
   goes on with the stored document, and one with a URI only the new
   document lists gets 503, as while another server holds the lease. A
   refresh that changes nothing makes no app-client write. One that changes
-  the list makes two. If the second finds the minute's writes spent, the
-  app client keeps the old callback URLs as well until a later refresh
-  removes them.
+  the list makes up to two: one to add callback URLs and one to remove
+  them. If the removal finds the minute's writes spent, the app client
+  keeps the old callback URLs as well until a later refresh removes them.
+  A callback URL on a host the server no longer trusts goes in the first
+  write.
 - A refresh never sends Cognito more than its limit of 100 callback URLs.
   If the stored and the fetched lists together have more, the app client
   gets the fetched list before the store does, as before this release.
