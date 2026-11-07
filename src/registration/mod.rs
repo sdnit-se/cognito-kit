@@ -809,8 +809,14 @@ impl Registrar {
         // it, while the store may still hold the old one.
         let mut narrowed = false;
         let refreshed = async {
+            // Cognito never gets a callback on a host this server no longer
+            // trusts: the front refuses it already, and once the store
+            // forgets it, only Cognito would still allow it. The store keeps
+            // it until a fetch drops it, so that cleanup finds it.
+            let trusted = |url: &String| url == relay || self.trusted(url);
             let old = callbacks(&leased.redirect_uris, relay);
-            let new = callbacks(&registration.redirect_uris, relay);
+            let mut new = callbacks(&registration.redirect_uris, relay);
+            new.retain(trusted);
             let allowed: BTreeSet<String> = self
                 .inner
                 .app_clients
@@ -822,11 +828,9 @@ impl Registrar {
             // list a sign-in reads from the store, Cognito allows it. Past
             // Cognito's limit, Cognito gets the new list alone, and still
             // before the store, so that only a redirect URI the document
-            // dropped is refused meanwhile. A callback on a host this server
-            // no longer trusts goes now: the front refuses it already, and
-            // once the store forgets it only Cognito would still allow it.
+            // dropped is refused meanwhile.
             let mut wanted: BTreeSet<String> = allowed.iter().chain(&old).chain(&new).cloned().collect();
-            wanted.retain(|url| url == relay || self.trusted(url));
+            wanted.retain(trusted);
             let over = wanted.len() > MAX_CALLBACKS;
             if over {
                 wanted = new.iter().cloned().collect();

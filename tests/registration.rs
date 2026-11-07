@@ -1508,6 +1508,44 @@ async fn a_refresh_never_leaves_a_host_no_longer_trusted_in_cognito_alone() {
 }
 
 #[tokio::test]
+async fn while_the_document_host_is_down_a_refresh_gives_cognito_no_host_no_longer_trusted() {
+    const CHATGPT_CALLBACK: &str = "https://chatgpt.com/connector/oauth/callback";
+    let (cognito, store, documents) = (FakeCognito::new(), MemoryStore::new(), Documents::default());
+    documents.serve(CLAUDE, &claude_document(&[CLAUDE_CALLBACK, CHATGPT_CALLBACK]));
+    let registrar = Registrar::builder(cognito.clone(), store.clone())
+        .fetcher(documents.clone())
+        .client_hosts(["claude.ai", "chatgpt.com"])
+        .build()
+        .unwrap();
+    let both = serve(cognito.clone(), store.clone(), documents.clone(), registrar);
+    sign_in(&both, &claude(CLAUDE_CALLBACK)).await.unwrap();
+    // Cognito has a callback the store doesn't, so the refresh contracts.
+    let app_client = stored(&store).unwrap().app_client;
+    let drifted = [CLAUDE_CALLBACK, CHATGPT_CALLBACK, MOVED].map(str::to_owned);
+    cognito.set_callback_urls(&app_client, &drifted).await.unwrap();
+
+    // The operator stops trusting chatgpt.com, and the host is down.
+    due(&store);
+    let registrar = Registrar::builder(cognito.clone(), store.clone())
+        .fetcher(Down)
+        .client_hosts(["claude.ai"])
+        .build()
+        .unwrap();
+    let server = serve(cognito.clone(), store.clone(), Documents::default(), registrar);
+    let signed_in = sign_in(&server, &claude(CLAUDE_CALLBACK)).await;
+    assert!(signed_in.is_ok(), "{signed_in:?}");
+    assert_eq!(callbacks(&cognito, &store), [CLAUDE_CALLBACK]);
+    // The store still names the host, so cleanup finds it.
+    assert!(
+        stored(&store)
+            .unwrap()
+            .redirect_uris
+            .iter()
+            .any(|u| u == CHATGPT_CALLBACK)
+    );
+}
+
+#[tokio::test]
 async fn a_sign_in_is_not_sent_through_an_app_client_cleanup_deleted_before_the_refresh_contracted() {
     let (cognito, store) = (FakeCognito::new(), MemoryStore::new());
     let first = sharing(&cognito, &store, &Steps::default(), &[CLAUDE_CALLBACK, MOVED]);
