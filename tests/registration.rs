@@ -1450,11 +1450,14 @@ fn uris(uris: &[String]) -> Vec<&str> {
 
 #[tokio::test]
 async fn at_cognitos_limit_a_swap_the_store_misses_sends_on_only_what_cognito_and_the_store_list() {
-    let old: Vec<String> = (0..100)
+    // 99 web callbacks and a loopback one, which Cognito knows as the relay.
+    let mut old: Vec<String> = (0..99)
         .map(|i| format!("https://claude.ai/callback/{i}"))
         .collect();
+    old.push("http://127.0.0.1:1111/callback".into());
     let mut new = old.clone();
-    new[99] = "https://claude.ai/callback/new".into();
+    new[98] = "https://claude.ai/callback/new".into();
+    new[99] = "http://127.0.0.1:2222/callback".into();
     let (cognito, store) = (FakeCognito::new(), MemoryStore::new());
     let first = sharing(&cognito, &store, &Steps::default(), &uris(&old));
     sign_in(&first, &claude(&old[0])).await.unwrap();
@@ -1465,12 +1468,19 @@ async fn at_cognitos_limit_a_swap_the_store_misses_sends_on_only_what_cognito_an
     // Cognito gets the new list alone before the store, which fails.
     // Cognito no longer allows the dropped URI, and token redemption reads
     // the store, which doesn't list the added one yet.
-    for uri in [&old[99], &new[99]] {
+    for uri in [&old[98], &new[98]] {
         let answer = get(&server.front, &authorize_url(CLAUDE, uri, true)).await;
         assert_eq!(location(&answer), None, "{uri} is never sent on");
     }
     let signed_in = sign_in(&server, &claude(&old[0])).await;
     assert!(signed_in.is_ok(), "{signed_in:?}");
+    // A loopback redirect URI matches on any port, in both lists.
+    let answer = get(
+        &server.front,
+        &authorize_url(CLAUDE, "http://127.0.0.1:3333/callback", true),
+    )
+    .await;
+    assert_eq!(answer.status(), StatusCode::FOUND, "{}", answer.body());
 }
 
 #[tokio::test]

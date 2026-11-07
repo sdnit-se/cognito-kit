@@ -881,7 +881,7 @@ impl Registrar {
                 let both = leased
                     .redirect_uris
                     .iter()
-                    .filter(|uri| registration.redirect_uris.contains(uri))
+                    .filter(|uri| redirect::find(&registration.redirect_uris, uri).is_some())
                     .cloned()
                     .collect();
                 as_stored(
