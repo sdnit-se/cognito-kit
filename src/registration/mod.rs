@@ -757,6 +757,19 @@ impl Registrar {
             Err(error) => return Err(RegistrationError::Fetch(error)),
         };
 
+        // Cognito allows every list the store holds while a refresh runs.
+        // So while another refresh holds the lease, or this one can't
+        // finish, a sign-in goes on with the registration as stored. Only
+        // one whose redirect URI the fetched document alone lists fails.
+        let new = metadata.as_ref().is_ok_and(|m| lists(&m.redirect_uris));
+        let as_stored = |registration: Registration, error| {
+            if new && !lists(&registration.redirect_uris) {
+                Err(error)
+            } else {
+                Ok(registration)
+            }
+        };
+
         // Refreshes take turns, also across processes. Cognito can't make a
         // write conditional, so two refreshes of one document at once could
         // cross. The fetch can take a while, so from here on the refresh
@@ -764,27 +777,15 @@ impl Registrar {
         let at = now();
         let lease = Lease::new(owner(), at + LEASE.as_secs());
         let leased = match stored {
-            Some(_) => self
-                .inner
-                .store
-                .lease(url.as_str(), &lease, at)
-                .await
-                .map_err(unavailable)?,
+            Some(stored) => match self.inner.store.lease(url.as_str(), &lease, at).await {
+                Ok(leased) => leased,
+                Err(error) => return as_stored(stored, unavailable(error)),
+            },
             None => None,
         };
         let leased = match leased {
             Some(Leased::Taken(leased)) => leased,
-            // Cognito allows every list the store holds while a refresh
-            // runs. A redirect URI that only the fetched document lists
-            // waits for that refresh to store it.
-            Some(Leased::Held(current)) => {
-                let new = metadata.as_ref().is_ok_and(|m| lists(&m.redirect_uris));
-                return if new && !lists(&current.redirect_uris) {
-                    Err(RegistrationError::Busy)
-                } else {
-                    Ok(current)
-                };
-            }
+            Some(Leased::Held(current)) => return as_stored(current, RegistrationError::Busy),
             // Never registered, or removed by cleanup during the fetch.
             None => {
                 let metadata = metadata.map_err(RegistrationError::Fetch)?;
@@ -804,7 +805,6 @@ impl Registrar {
             },
             _ => leased.clone(),
         };
-        let repair = registration == leased;
         let refreshed = async {
             let old = callbacks(&leased.redirect_uris, relay);
             let new = callbacks(&registration.redirect_uris, relay);
@@ -858,9 +858,7 @@ impl Registrar {
         let _ = self.inner.store.release(url.as_str(), &lease).await;
         match refreshed {
             Ok(registration) => Ok(registration),
-            // A refused repair leaves the registration as leased.
-            Err(Stopped::Refused(_)) if repair => Ok(leased),
-            Err(Stopped::Refused(error)) => Err(error),
+            Err(Stopped::Refused(error)) => as_stored(leased, error),
             Err(Stopped::Lost) => Err(unavailable(
                 "cleanup or another refresh took the registration".into(),
             )),

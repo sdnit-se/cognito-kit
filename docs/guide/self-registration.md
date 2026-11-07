@@ -180,17 +180,18 @@ on the app client. A refresh while the host is down does the same with
 the stored list, which repairs an app client that lacks one of its
 callback URLs.
 
-While another server holds the lease, a sign-in with a redirect URI that
-the store lists then goes on as usual, through the app client the store
-names then. One with a URI that only the new document lists gets a 503 and
-can try again a moment later. A lease lasts 30 seconds from when it is
-taken, longer than a refresh takes. A server that stops mid-refresh
-leaves its lease to run out, and a refresh whose lease ran out and was
-taken over stops at its store write. A refresh's Cognito writes can't be
-made conditional, so it must make them within 30 seconds of taking the
-lease. A Lambda function whose timeout fits behind API Gateway's 29
-seconds is stopped before that. Keep servers' clocks within a few seconds
-of each other, as NTP does.
+While another server holds the lease, or a refresh can't finish because
+Cognito or the store fails or the minute's app-client writes are spent, a
+sign-in with a redirect URI that the store lists then goes on as usual,
+through the app client the store names then. One with a URI that only the
+new document lists gets a 503 and can try again a moment later. A lease
+lasts 30 seconds from when it is taken, longer than a refresh takes. A
+server that stops mid-refresh leaves its lease to run out, and a refresh
+whose lease ran out and was taken over stops at its store write. A
+refresh's Cognito writes can't be made conditional, so it must make them
+within 30 seconds of taking the lease. A Lambda function whose timeout
+fits behind API Gateway's 29 seconds is stopped before that. Keep servers'
+clocks within a few seconds of each other, as NTP does.
 
 Cognito allows 100 callback URLs per app client. If the stored and the
 fetched lists together have more, step 1 sets the fetched list alone, and

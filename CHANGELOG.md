@@ -29,11 +29,14 @@
   `DescribeUserPoolClient`, and sets them to the stored list if they
   differ, also while the document's host is down. So an app client that
   lacks a stored callback URL, as earlier releases could leave it, is
-  repaired by the next refresh. If Cognito doesn't answer, that sign-in
-  gets 503, or the stored document while its host is down. A refresh that
-  changes nothing makes no app-client write. One that changes the list
-  makes two. If the second finds the minute's writes spent, the app client
-  keeps the old callback URLs as well until a later refresh removes them.
+  repaired by the next refresh. If Cognito or the store fails, or no
+  app-client write is left, a sign-in with a redirect URI the store lists
+  goes on with the stored document, and one with a URI only the new
+  document lists gets 503, as while another server holds the lease. A
+  refresh that changes nothing makes no app-client write. One that changes
+  the list makes two. If the second finds the minute's writes spent, the
+  app client keeps the old callback URLs as well until a later refresh
+  removes them.
 - A refresh never sends Cognito more than its limit of 100 callback URLs.
   If the stored and the fetched lists together have more, the app client
   gets the fetched list before the store does, as before this release.
