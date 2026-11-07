@@ -6,7 +6,7 @@ Turn it on for your tests only:
 
 ```toml
 [dev-dependencies]
-cognito-kit = { version = "0.3", features = ["test-kit"] }
+cognito-kit = { version = "0.4", features = ["test-kit"] }
 ```
 
 The example below also uses the crate's `axum` feature for the extractor,
@@ -14,7 +14,7 @@ and calls the router directly:
 
 ```toml
 [dev-dependencies]
-cognito-kit = { version = "0.3", features = ["test-kit", "axum"] }
+cognito-kit = { version = "0.4", features = ["test-kit", "axum"] }
 axum = "0.8"
 http = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
