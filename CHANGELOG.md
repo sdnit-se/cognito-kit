@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 (2026-11-07)
 
 - **A client that changes its redirect URIs keeps signing in.** A refresh
   of a metadata document now takes a lease on its registration in the
