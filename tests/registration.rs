@@ -1444,6 +1444,33 @@ async fn a_document_at_cognitos_limit_of_100_callback_urls_can_swap_one() {
     assert_eq!(allowed, new);
 }
 
+fn uris(uris: &[String]) -> Vec<&str> {
+    uris.iter().map(String::as_str).collect()
+}
+
+#[tokio::test]
+async fn at_cognitos_limit_a_swap_the_store_misses_sends_on_only_what_cognito_allows() {
+    let old: Vec<String> = (0..100)
+        .map(|i| format!("https://claude.ai/callback/{i}"))
+        .collect();
+    let mut new = old.clone();
+    new[99] = "https://claude.ai/callback/new".into();
+    let (cognito, store) = (FakeCognito::new(), MemoryStore::new());
+    let first = sharing(&cognito, &store, &Steps::default(), &uris(&old));
+    sign_in(&first, &claude(&old[0])).await.unwrap();
+    due(&store);
+    let steps = Steps::default();
+    steps.fail("update");
+    let server = sharing(&cognito, &store, &steps, &uris(&new));
+    // Cognito gets the new list alone before the store, which fails.
+    let dropped = get(&server.front, &authorize_url(CLAUDE, &old[99], true)).await;
+    assert_eq!(location(&dropped), None, "the dropped URI is never sent on");
+    for uri in [&old[0], &new[99]] {
+        let signed_in = sign_in(&server, &claude(uri)).await;
+        assert!(signed_in.is_ok(), "{uri}: {signed_in:?}");
+    }
+}
+
 #[tokio::test]
 async fn a_document_due_for_a_refresh_signs_in_with_no_app_client_writes_left() {
     let server = open_server();
@@ -1460,13 +1487,14 @@ async fn a_document_due_for_a_refresh_signs_in_with_no_app_client_writes_left() 
 }
 
 /// When `call` fails a due refresh, as a throttled AWS call does, and
-/// whether the document is unchanged, adds a redirect URI or can't be
-/// fetched, a sign-in with the stored redirect URI completes. One with a
+/// whether the document is unchanged, adds or swaps a redirect URI or can't
+/// be fetched, a sign-in with the stored redirect URI completes. One with a
 /// redirect URI only the new document lists is told to try again.
 async fn signs_in_while_failing(call: &'static str) {
     for document in [
         Some(&[CLAUDE_CALLBACK][..]),
         Some(&[CLAUDE_CALLBACK, MOVED]),
+        Some(&[MOVED]),
         None,
     ] {
         let context = format!("{call} fails, document {document:?}");

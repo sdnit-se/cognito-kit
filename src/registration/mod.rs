@@ -805,6 +805,9 @@ impl Registrar {
             },
             _ => leased.clone(),
         };
+        // Past Cognito's limit, Cognito holds the new list alone once it has
+        // it, so a refresh that stops after that serves the new list.
+        let mut narrowed = false;
         let refreshed = async {
             let old = callbacks(&leased.redirect_uris, relay);
             let new = callbacks(&registration.redirect_uris, relay);
@@ -821,7 +824,8 @@ impl Registrar {
             // before the store, so that only a redirect URI the document
             // dropped is refused meanwhile.
             let mut wanted: BTreeSet<String> = allowed.iter().chain(&old).chain(&new).cloned().collect();
-            if wanted.len() > MAX_CALLBACKS {
+            let over = wanted.len() > MAX_CALLBACKS;
+            if over {
                 wanted = new.iter().cloned().collect();
             }
             if wanted != allowed {
@@ -832,6 +836,7 @@ impl Registrar {
                     .set_callback_urls(&leased.app_client, &wanted)
                     .await?;
             }
+            narrowed = over;
             // A refresh whose lease ran out and was taken over stops here,
             // and leaves the rest to the one that took it.
             let landed = self
@@ -852,13 +857,13 @@ impl Registrar {
                     .set_callback_urls(&leased.app_client, &new)
                     .await;
             }
-            Ok(registration)
+            Ok(())
         }
         .await;
         let _ = self.inner.store.release(url.as_str(), &lease).await;
         match refreshed {
-            Ok(registration) => Ok(registration),
-            Err(Stopped::Refused(error)) => as_stored(leased, error),
+            Ok(()) => Ok(registration),
+            Err(Stopped::Refused(error)) => as_stored(if narrowed { registration } else { leased }, error),
             Err(Stopped::Lost) => Err(unavailable(
                 "cleanup or another refresh took the registration".into(),
             )),
