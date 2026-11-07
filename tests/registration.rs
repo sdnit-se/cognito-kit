@@ -636,7 +636,8 @@ async fn cleanup_keeps_a_client_whose_first_use_failed_to_record() {
 
 /// While holding, every app-client and store call that a [`Held`] server
 /// makes waits until the test lets it go, so a test can step through a
-/// refresh, or run two in any order.
+/// refresh, or run two in any order. A call named by [`fail`](Self::fail)
+/// fails, as a throttled AWS call does.
 #[derive(Clone, Default)]
 struct Steps(Arc<Calls>);
 
@@ -644,6 +645,17 @@ struct Steps(Arc<Calls>);
 struct Calls {
     holding: AtomicBool,
     held: Mutex<Vec<(&'static str, oneshot::Sender<()>)>>,
+    failing: Mutex<Option<&'static str>>,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("throttled")]
+struct Throttled;
+
+impl From<Throttled> for AdminError {
+    fn from(throttled: Throttled) -> Self {
+        AdminError::Other(Arc::new(throttled.into()))
+    }
 }
 
 impl Steps {
@@ -651,11 +663,19 @@ impl Steps {
         self.0.holding.store(true, Ordering::SeqCst);
     }
 
-    async fn wait(&self, call: &'static str) {
+    fn fail(&self, call: &'static str) {
+        *self.0.failing.lock().unwrap() = Some(call);
+    }
+
+    async fn wait(&self, call: &'static str) -> Result<(), Throttled> {
         if self.0.holding.load(Ordering::SeqCst) {
             let (go, gone) = oneshot::channel();
             self.0.held.lock().unwrap().push((call, go));
             let _ = gone.await;
+        }
+        match *self.0.failing.lock().unwrap() {
+            Some(failing) if failing == call => Err(Throttled),
+            _ => Ok(()),
         }
     }
 
@@ -771,13 +791,13 @@ impl AppClients for Held {
         callback_urls: &'a [String],
     ) -> BoxFuture<'a, Result<ClientId, AdminError>> {
         Box::pin(async move {
-            self.steps.wait("create").await;
+            self.steps.wait("create").await?;
             self.cognito.create(name, callback_urls).await
         })
     }
     fn callback_urls<'a>(&'a self, client: &'a ClientId) -> BoxFuture<'a, Result<Vec<String>, AdminError>> {
         Box::pin(async move {
-            self.steps.wait("callback_urls").await;
+            self.steps.wait("callback_urls").await?;
             self.cognito.callback_urls(client).await
         })
     }
@@ -787,25 +807,25 @@ impl AppClients for Held {
         urls: &'a [String],
     ) -> BoxFuture<'a, Result<(), AdminError>> {
         Box::pin(async move {
-            self.steps.wait("set_callback_urls").await;
+            self.steps.wait("set_callback_urls").await?;
             self.cognito.set_callback_urls(client, urls).await
         })
     }
     fn delete<'a>(&'a self, client: &'a ClientId) -> BoxFuture<'a, Result<(), AdminError>> {
         Box::pin(async move {
-            self.steps.wait("delete").await;
+            self.steps.wait("delete").await?;
             self.cognito.delete(client).await
         })
     }
     fn list<'a>(&'a self, prefix: &'a str) -> BoxFuture<'a, Result<Vec<ClientId>, AdminError>> {
         Box::pin(async move {
-            self.steps.wait("list").await;
+            self.steps.wait("list").await?;
             self.cognito.list(prefix).await
         })
     }
     fn created<'a>(&'a self, client: &'a ClientId) -> BoxFuture<'a, Result<SystemTime, AdminError>> {
         Box::pin(async move {
-            self.steps.wait("created").await;
+            self.steps.wait("created").await?;
             self.cognito.created(client).await
         })
     }
@@ -814,7 +834,7 @@ impl AppClients for Held {
 impl RegistrationStore for Held {
     fn get<'a>(&'a self, client_id: &'a str) -> BoxFuture<'a, Result<Option<Registration>, BoxError>> {
         Box::pin(async move {
-            self.steps.wait("get").await;
+            self.steps.wait("get").await?;
             self.store.get(client_id).await
         })
     }
@@ -823,13 +843,13 @@ impl RegistrationStore for Held {
         app_client: &'a ClientId,
     ) -> BoxFuture<'a, Result<Option<Registration>, BoxError>> {
         Box::pin(async move {
-            self.steps.wait("get_by_app_client").await;
+            self.steps.wait("get_by_app_client").await?;
             self.store.get_by_app_client(app_client).await
         })
     }
     fn insert(&self, registration: Registration) -> BoxFuture<'_, Result<Registration, BoxError>> {
         Box::pin(async move {
-            self.steps.wait("insert").await;
+            self.steps.wait("insert").await?;
             self.store.insert(registration).await
         })
     }
@@ -840,7 +860,7 @@ impl RegistrationStore for Held {
         now: u64,
     ) -> BoxFuture<'a, Result<Option<Leased>, BoxError>> {
         Box::pin(async move {
-            self.steps.wait("lease").await;
+            self.steps.wait("lease").await?;
             let lease = Lease::new(lease.owner.clone(), lease.until + self.ahead);
             self.store.lease(client_id, &lease, now + self.ahead).await
         })
@@ -851,31 +871,31 @@ impl RegistrationStore for Held {
         lease: &'a Lease,
     ) -> BoxFuture<'a, Result<bool, BoxError>> {
         Box::pin(async move {
-            self.steps.wait("update").await;
+            self.steps.wait("update").await?;
             self.store.update(registration, lease).await
         })
     }
     fn release<'a>(&'a self, client_id: &'a str, lease: &'a Lease) -> BoxFuture<'a, Result<(), BoxError>> {
         Box::pin(async move {
-            self.steps.wait("release").await;
+            self.steps.wait("release").await?;
             self.store.release(client_id, lease).await
         })
     }
     fn touch<'a>(&'a self, client_id: &'a str, at: u64) -> BoxFuture<'a, Result<(), BoxError>> {
         Box::pin(async move {
-            self.steps.wait("touch").await;
+            self.steps.wait("touch").await?;
             self.store.touch(client_id, at).await
         })
     }
     fn remove<'a>(&'a self, registration: &'a Registration) -> BoxFuture<'a, Result<(), BoxError>> {
         Box::pin(async move {
-            self.steps.wait("remove").await;
+            self.steps.wait("remove").await?;
             self.store.remove(registration).await
         })
     }
     fn list(&self) -> BoxFuture<'_, Result<Vec<Registration>, BoxError>> {
         Box::pin(async move {
-            self.steps.wait("list").await;
+            self.steps.wait("list").await?;
             self.store.list().await
         })
     }
@@ -1437,4 +1457,55 @@ async fn a_document_due_for_a_refresh_signs_in_with_no_app_client_writes_left() 
     let signed_in = sign_in(&server, &claude(CLAUDE_CALLBACK)).await;
     assert!(signed_in.is_ok(), "{signed_in:?}");
     assert_eq!(server.documents.fetches(), fetches + 1, "refreshed");
+}
+
+/// When `call` fails a due refresh, as a throttled AWS call does, and
+/// whether the document is unchanged, adds a redirect URI or can't be
+/// fetched, a sign-in with the stored redirect URI completes. One with a
+/// redirect URI only the new document lists is told to try again.
+async fn signs_in_while_failing(call: &'static str) {
+    for document in [
+        Some(&[CLAUDE_CALLBACK][..]),
+        Some(&[CLAUDE_CALLBACK, MOVED]),
+        None,
+    ] {
+        let context = format!("{call} fails, document {document:?}");
+        let (cognito, store) = shared_pool().await;
+        due(&store);
+        let steps = Steps::default();
+        steps.fail(call);
+        let server = match document {
+            Some(uris) => sharing(&cognito, &store, &steps, uris),
+            None => {
+                let held = Held {
+                    cognito: cognito.clone(),
+                    store: store.clone(),
+                    steps,
+                    ahead: 0,
+                };
+                fetching(held, Documents::default(), Down)
+            }
+        };
+        let signed_in = sign_in(&server, &claude(CLAUDE_CALLBACK)).await;
+        assert!(signed_in.is_ok(), "{context}: {signed_in:?}");
+        if document.is_some_and(|uris| uris.contains(&MOVED)) {
+            let answer = get(&server.front, &authorize_url(CLAUDE, MOVED, true)).await;
+            assert_eq!(answer.status(), StatusCode::SERVICE_UNAVAILABLE, "{context}");
+            assert_eq!(location(&answer), None, "{context}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_due_sign_in_with_a_stored_redirect_uri_completes_while_cognito_fails() {
+    for call in ["callback_urls", "set_callback_urls"] {
+        signs_in_while_failing(call).await;
+    }
+}
+
+#[tokio::test]
+async fn a_due_sign_in_with_a_stored_redirect_uri_completes_while_the_store_fails() {
+    for call in ["lease", "update"] {
+        signs_in_while_failing(call).await;
+    }
 }
