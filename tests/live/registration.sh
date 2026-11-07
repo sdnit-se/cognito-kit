@@ -75,7 +75,8 @@ for _ in $(seq 50); do curl -s -o /dev/null "$base/.well-known/oauth-authorizati
 
 # A failed flow or cleanup fails the run, after the checks below.
 status=0
-BASE="$base" USER_FILE="$work/user.json" bun tests/live/registration.ts || status=$?
+BASE="$base" USER_FILE="$work/user.json" COGNITO_POOL_ID="$pool" REGISTRATION_TABLE="$name" \
+  bun tests/live/registration.ts || status=$?
 
 echo "app clients after the run:"
 aws cognito-idp list-user-pool-clients --user-pool-id "$pool" --max-results 60 \

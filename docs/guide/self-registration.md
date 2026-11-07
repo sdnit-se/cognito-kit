@@ -160,6 +160,49 @@ minute, when a client asks for a redirect URI that the stored document
 doesn't list. If the host is down, a document that was valid before stays
 in use.
 
+Once its fetch is done, a refresh takes a lease on the registration in
+the store, so that refreshes of one document take turns, also across
+servers. Cognito can't make a change conditional, so two refreshes at once
+could otherwise leave the app client without a callback URL that the store
+lists. Taking the lease returns the registration as stored then, and the
+refresh goes by that copy, since another refresh may have stored a newer
+document during the fetch, or cleanup may have removed the registration.
+A fetched document replaces the stored one only if its fetch began after
+the stored one's. While the lease is held, the registrar:
+
+1. Reads the app client's callback URLs. If they lack a URL of the stored
+   list or of the fetched one, it adds them.
+2. Stores the fetched document, if it still holds the lease.
+3. Removes the callback URLs that the stored document no longer lists.
+
+So a sign-in that read either list from the store finds its callback URL
+on the app client. A refresh while the host is down does the same with
+the stored list, which repairs an app client that lacks one of its
+callback URLs.
+
+While another server holds the lease, or a refresh can't finish because
+Cognito or the store fails or the minute's app-client writes are spent, a
+sign-in with a redirect URI that the store lists then goes on as usual,
+through the app client the store names then. One with a URI that only the
+new document lists gets a 503 and can try again a moment later. A lease
+lasts 30 seconds from when it is taken, longer than a refresh takes. A
+server that stops mid-refresh leaves its lease to run out, and a refresh
+whose lease ran out and was taken over stops at its store write. A
+refresh's Cognito writes can't be made conditional, so it must make them
+within 30 seconds of taking the lease. A Lambda function whose timeout
+fits behind API Gateway's 29 seconds is stopped before that. Keep servers'
+clocks within a few seconds of each other, as NTP does.
+
+Cognito allows 100 callback URLs per app client. If the stored and the
+fetched lists together have more, step 1 sets the fetched list alone, and
+step 3 has nothing left to remove. Until step 2, a sign-in with a URI the
+document dropped is refused.
+
+Managed login can take minutes to accept a callback URL added to an
+existing app client, as the section above says. So a web client's new
+https redirect URI can get `redirect_mismatch` at managed login for that
+long.
+
 To fetch through your own egress, implement
 [`FetchDocument`](crate::registration::FetchDocument) and pass it to
 [`fetcher`](crate::registration::RegistrarBuilder::fetcher). It must refuse
@@ -180,7 +223,11 @@ working.
 
 Cognito allows five app-client changes per second per pool, shared with
 every other caller. Each registrar makes at most ten a minute on behalf
-of requests, and answers 503 above that. Build one per process. Behind
+of requests, and answers 503 above that. A refresh that finds a
+document's redirect URIs changed makes up to two: one to add callback
+URLs and one to remove them. If none is left for the removal, the app
+client keeps the old callback URLs as well until a later refresh removes
+them. Build one per process. Behind
 several instances, that is ten per instance, so also put a rate rule, such
 as an AWS WAF rule, in front of `/oauth2/authorize` and `/oauth2/register`.
 
@@ -242,7 +289,10 @@ one instance is known on all of them.
   [`Registration`](crate::registration::Registration) serializes to JSON.
   `insert` must keep the first registration for a `client_id` and return
   it to the second writer, because two servers can register one client at
-  once.
+  once. `lease` must be one conditional write that returns the
+  registration as stored, whether or not the caller got the lease, and
+  `update` and `release` must check the lease's owner,
+  because two servers can refresh one document at once.
 
 [`Registrar`]: crate::registration::Registrar
 [`CognitoApi`]: crate::registration::CognitoApi

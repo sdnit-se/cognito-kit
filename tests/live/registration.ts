@@ -1,20 +1,27 @@
 // Connects clients to tests/live/server with no client id configured: Claude
 // Code's metadata document and its Dynamic Client Registration, scripted as
 // Claude Code does them, then the real Codex CLI by document and by
-// registration. Prints what it saw as JSON and never prints a token or the
-// password.
+// registration. Between them, it changes Claude Code's stored document in
+// the table so that the next sign-in refreshes it, and then plants another
+// server's lease on it so that the next one doesn't. Prints what it saw as
+// JSON and never prints a token or the password, then fails on each outcome
+// that outcomes.ts expects and a flow missed.
 //
 //   BASE=http://localhost:3000 USER_FILE=<json with email, password> \
+//   COGNITO_POOL_ID=<pool> REGISTRATION_TABLE=<table> \
 //   PLAYWRIGHT=<path to playwright's index.mjs> [CODEX=codex] bun tests/live/registration.ts
 import { createHash, randomBytes } from 'node:crypto';
 import { mkdtempSync, readFileSync, writeFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { check } from './outcomes.ts';
 
 const { chromium } = await import(process.env.PLAYWRIGHT ?? 'playwright');
 const BASE = process.env.BASE!;
 const MCP = `${BASE}/mcp`;
 const CLAUDE_CODE = 'https://claude.ai/oauth/claude-code-client-metadata';
+const POOL = process.env.COGNITO_POOL_ID!;
+const TABLE = process.env.REGISTRATION_TABLE!;
 const user = JSON.parse(readFileSync(process.env.USER_FILE!, 'utf8'));
 const report: Record<string, unknown> = {};
 const b64url = (buf: Uint8Array) => Buffer.from(buf).toString('base64url');
@@ -24,6 +31,15 @@ const form = (body: Record<string, string>) => ({
   headers: { 'content-type': 'application/x-www-form-urlencoded' },
   body: new URLSearchParams(body),
 });
+
+/// The AWS CLI's JSON answer. An error names no account: its id is masked.
+function aws(...args: string[]) {
+  const run = Bun.spawnSync(['aws', ...args, '--output', 'json'], { stderr: 'pipe' });
+  if (run.exitCode !== 0) {
+    throw new Error(`aws ${args[1]}: ${run.stderr.toString().replace(/\d{12}/g, '<account>').slice(0, 300)}`);
+  }
+  return JSON.parse(run.stdout.toString() || 'null');
+}
 
 async function signInIfAsked(page: any) {
   const email = page.locator('input[type=email], input[name=username], input[name=email]').first();
@@ -62,6 +78,15 @@ page.on('request', (request: any) => {
 /// A CLI's loopback listener.
 function listen(port: number) {
   return Bun.serve({ port, hostname: '127.0.0.1', fetch: () => new Response('ok') });
+}
+
+/// The client_id of each dynamic registration in the table.
+function registeredClients(): string[] {
+  const scan = aws('dynamodb', 'scan', '--table-name', TABLE, '--consistent-read',
+    '--filter-expression', '#kind = :dynamic', '--projection-expression', 'client_id',
+    '--expression-attribute-names', JSON.stringify({ '#kind': 'kind' }),
+    '--expression-attribute-values', JSON.stringify({ ':dynamic': { S: 'dynamic' } }));
+  return scan.Items.map((item: any) => item.client_id.S);
 }
 
 /// Follows an authorization URL through managed login to the loopback callback.
@@ -159,6 +184,44 @@ try {
     await attempt(() => claudeCode(CLAUDE_CODE, `http://localhost:${port()}/callback`, asm, prm)),
   ];
 
+  // Claude Code by its document once more, after its stored copy is made to
+  // list a web callback that its app client lacks, and to be due. The
+  // refresh gives the app client both lists, stores the fetched one, and
+  // leaves the app client with the relay alone.
+  report.claudeCodeAfterChange = await attempt(async () => {
+    const planted = 'https://claude.ai/api/mcp/auth_callback';
+    const key = JSON.stringify({ pk: { S: `client#${CLAUDE_CODE}` } });
+    aws('dynamodb', 'update-item', '--table-name', TABLE, '--key', key,
+      '--update-expression', 'SET redirect_uris = :uris, fetched_at = :due',
+      '--expression-attribute-values', JSON.stringify({ ':uris': { L: [{ S: planted }] }, ':due': { N: '0' } }));
+    const flow: any = await claudeCode(CLAUDE_CODE, `http://localhost:${port()}/callback`, asm, prm);
+    const item = aws('dynamodb', 'get-item', '--table-name', TABLE, '--key', key, '--consistent-read').Item;
+    return {
+      ...flow,
+      refreshed: Number(item.fetched_at.N) > 0 && !item.redirect_uris.L.some((u: any) => u.S === planted),
+      callbacks: aws('cognito-idp', 'describe-user-pool-client', '--user-pool-id', POOL,
+        '--client-id', flow.access.client_id, '--query', 'UserPoolClient.CallbackURLs'),
+    };
+  });
+
+  // Claude Code by its document again, due, while another server holds the
+  // lease on its registration. The sign-in goes on with the stored
+  // document, and leaves the refresh to that server.
+  report.claudeCodeWhileLeased = await attempt(async () => {
+    const key = JSON.stringify({ pk: { S: `client#${CLAUDE_CODE}` } });
+    const until = Math.floor(Date.now() / 1000) + 120;
+    aws('dynamodb', 'update-item', '--table-name', TABLE, '--key', key,
+      '--update-expression', 'SET lease_owner = :owner, lease_until = :until, fetched_at = :due',
+      '--expression-attribute-values', JSON.stringify({ ':owner': { S: 'live-test' }, ':until': { N: String(until) }, ':due': { N: '0' } }));
+    try {
+      const flow = await claudeCode(CLAUDE_CODE, `http://localhost:${port()}/callback`, asm, prm);
+      const item = aws('dynamodb', 'get-item', '--table-name', TABLE, '--key', key, '--consistent-read').Item;
+      return { ...flow, leaseKept: item.lease_owner?.S === 'live-test', refreshed: Number(item.fetched_at.N) > 0 };
+    } finally {
+      aws('dynamodb', 'update-item', '--table-name', TABLE, '--key', key, '--update-expression', 'REMOVE lease_owner, lease_until');
+    }
+  });
+
   // Claude Code by Dynamic Client Registration, as when a server offers no documents.
   const redirect = `http://localhost:${port()}/callback`;
   const registered = await fetch(asm.registration_endpoint, {
@@ -178,6 +241,7 @@ try {
   // The real Codex CLI, by document and by registration.
   const codex = process.env.CODEX ?? 'codex';
   for (const strategy of ['cimd', 'dcr']) report[`codexBy${strategy}`] = await attempt(async () => {
+    const before = registeredClients();
     const home = mkdtempSync(join(tmpdir(), 'codex-live-'));
     writeFileSync(join(home, 'config.toml'), `mcp_oauth_credentials_store = "file"\n[mcp_servers.portal]\nurl = "${MCP}"\n`);
     const child = Bun.spawn([codex, 'mcp', 'login', 'portal', '--no-browser', '--oauth-client-registration', strategy], {
@@ -212,7 +276,8 @@ try {
       const credentials = stored.length ? readFileSync(join(home, stored[0]), 'utf8') : '';
       const access = /"access_token"\s*:\s*"([^"]+)"/.exec(credentials)?.[1];
       return {
-        exit, clientIdIsUrl: sent.searchParams.get('client_id')?.startsWith('https://'),
+        exit, server: MCP, clientId: sent.searchParams.get('client_id'),
+        registered: registeredClients().filter((id) => !before.includes(id)),
         redirect: sent.searchParams.get('redirect_uri')?.replace(/:\d+\//, ':<port>/'),
         resource: sent.searchParams.get('resource'), stored: stored.length > 0,
         access: access ? { aud: claimsOf(access).aud, scope: claimsOf(access).scope } : null,
@@ -229,4 +294,4 @@ try {
   await browser.close();
 }
 console.log(JSON.stringify(report, null, 2));
-if (JSON.stringify(report).includes('"failure"')) process.exitCode = 1;
+check(report);

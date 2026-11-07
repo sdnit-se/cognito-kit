@@ -1,5 +1,64 @@
 # Changelog
 
+## Unreleased
+
+- **A client that changes its redirect URIs keeps signing in.** A refresh
+  of a metadata document now takes a lease on its registration in the
+  store, so refreshes take turns, also across servers. Under the lease it
+  adds the new callback URLs to the app client before it stores the
+  document, and removes the dropped ones after. A sign-in that read
+  either list from the store finds its callback URL on the app client.
+  Before, a refresh replaced the callback URLs first, and two refreshes at
+  once could leave the store listing a URI that the app client lacked
+  until the document changed again (#6).
+- While another server holds the lease, a sign-in with a redirect URI the
+  store lists goes on, and one with a URI that only the new document lists
+  gets 503. A lease runs out after 30 seconds, so a server that stops
+  mid-refresh holds the document back no longer than that. A refresh whose
+  lease ran out and was taken over doesn't store its fetch.
+- A refresh goes by the registration as taking the lease finds it, not as
+  read before the fetch. A fetched document replaces the stored one only
+  if its fetch began after the stored one's, so a slow fetch can't undo a
+  newer refresh, or a registration that a sign-in made again after
+  cleanup. A sign-in that finds another server's lease goes on with the
+  registration as stored then, and one that finds it removed registers
+  the document again. A refresh that finds the app client gone answers
+  503, also while the host is down. The lease's 30 seconds count from when
+  it is taken, after the fetch.
+- Every refresh reads the app client's callback URLs, one
+  `DescribeUserPoolClient`, and sets them to the stored list if they
+  differ, also while the document's host is down. So an app client that
+  lacks a stored callback URL, as earlier releases could leave it, is
+  repaired by the next refresh. If Cognito or the store fails, or no
+  app-client write is left, a sign-in with a redirect URI the store lists
+  goes on with the stored document, and one with a URI only the new
+  document lists gets 503, as while another server holds the lease. A
+  refresh that changes nothing makes no app-client write. One that changes
+  the list makes up to two: one to add callback URLs and one to remove
+  them. If the removal finds the minute's writes spent, the app client
+  keeps the old callback URLs as well until a later refresh removes them.
+  A callback URL on a host the server no longer trusts goes in the first
+  write.
+- A refresh never sends Cognito more than its limit of 100 callback URLs.
+  If the stored and the fetched lists together have more, the app client
+  gets the fetched list before the store does, as before this release.
+- `FakeCognito` refuses more than 100 callback URLs on an app client, as
+  Cognito does.
+- **Breaking:** `RegistrationStore` has two new methods, `lease`, which
+  returns the registration as stored and whether the caller got the lease
+  (`Leased`), and `release`. `update` takes the `Lease` and returns whether
+  it stored the registration. `DynamoStore` keeps the lease in two
+  attributes of the registration's item, with the `UpdateItem` permission
+  it already needed, and reads a refused lease's item from the refusal.
+  `MemoryStore` implements them too. If you implement `RegistrationStore`
+  yourself, make `lease` one conditional write that returns the
+  registration either way, as its docs say.
+- **Breaking:** `AppClients` has a new method, `callback_urls`. `CognitoApi`
+  and `FakeCognito` implement it. If you implement `AppClients` yourself,
+  add it.
+- During a rolling deploy, servers on 0.3 take no lease, so their
+  refreshes can still cross others' until every server runs this release.
+
 ## 0.3.1 (2026-11-05)
 
 - `FakeCognito`'s ID tokens carry the sign-in's nonce, as Cognito's do, so

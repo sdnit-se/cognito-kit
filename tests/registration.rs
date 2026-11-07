@@ -1,20 +1,27 @@
 //! What an attacker, or an operator watching the pool, would notice about
 //! client registration: where codes may go, which documents count, which
-//! tokens pass, and how app clients are kept in check.
+//! tokens pass, and how app clients are kept in check. And what a person
+//! signing in meets while a client's document changes.
 
 mod front;
 
-use std::sync::Arc;
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use cognito_kit::registration::{BoxFuture, Registrar, Registration, RegistrationStore};
+use cognito_kit::registration::{
+    AdminError, AppClients, BoxFuture, FetchDocument, FetchError, Lease, Leased, Registrar, Registration,
+    RegistrationStore,
+};
 use cognito_kit::test_kit::{FakeCognito, MemoryStore};
 use cognito_kit::{BoxError, ClientId};
+use tokio::sync::{Notify, oneshot};
+use tokio::task::JoinHandle;
 
 use front::{
-    Authorization, DRAFTS, Documents, MCP, ORIGIN, call_mcp, get, json, location, open_server, post_form,
-    post_json, serve, server, sign_in,
+    Authorization, DRAFTS, Documents, MCP, ORIGIN, Server, call_mcp, get, json, location, open_server,
+    post_form, post_json, serve, server, sign_in,
 };
 use http::StatusCode;
 use serde_json::json;
@@ -22,6 +29,12 @@ use url::Url;
 
 const CLAUDE: &str = "https://claude.ai/oauth/mcp-oauth-client-metadata";
 const CLAUDE_CALLBACK: &str = "https://claude.ai/api/mcp/auth_callback";
+const MOVED: &str = "https://claude.ai/api/mcp/auth_callback/2";
+const MOVED_AGAIN: &str = "https://claude.ai/api/mcp/auth_callback/3";
+
+fn now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+}
 
 fn claude_document(redirect_uris: &[&str]) -> String {
     json!({
@@ -54,6 +67,16 @@ fn registration(redirect_uris: &[&str]) -> serde_json::Value {
 }
 
 const REGISTER: &str = "https://portal.example.com/oauth2/register";
+
+fn claude(redirect_uri: &str) -> Authorization<'_> {
+    Authorization {
+        client_id: CLAUDE,
+        redirect_uri,
+        scope: DRAFTS,
+        resource: Some(MCP),
+        extra: &[],
+    }
+}
 
 #[tokio::test]
 async fn refuses_a_document_that_does_not_list_the_redirect_uri() {
@@ -426,14 +449,21 @@ async fn stale_writes_leave_a_newer_registration() {
     let url = authorize_url(CLAUDE, CLAUDE_CALLBACK, true);
     get(&server.front, &url).await;
     let first = server.store.registrations().remove(0);
+    let lease = Lease::new("refresh", u64::MAX);
+    let leased = server.store.lease(CLAUDE, &lease, 0).await.unwrap();
+    assert_eq!(leased, Some(Leased::Taken(first.clone())));
+    // Another refresh finds it held, and the registration as stored.
+    let another = Lease::new("another refresh", u64::MAX);
+    let held = server.store.lease(CLAUDE, &another, 0).await.unwrap();
+    assert_eq!(held, Some(Leased::Held(first.clone())));
     server.store.remove(&first).await.unwrap();
     // The next sign-in registers the document again, with a new app client.
     assert_eq!(get(&server.front, &url).await.status(), StatusCode::FOUND);
-    // A refresh that read the first registration stores its fetch late,
+    // A refresh that leased the first registration stores its fetch late,
     // and a cleanup that listed it removes it late.
     let mut refreshed = first.clone();
     refreshed.redirect_uris = vec!["https://claude.ai/api/mcp/old_callback".into()];
-    server.store.update(&refreshed).await.unwrap();
+    assert!(!server.store.update(&refreshed, &lease).await.unwrap());
     server.store.remove(&first).await.unwrap();
     let left = server.store.registrations();
     assert_eq!(left.len(), 1);
@@ -499,8 +529,23 @@ impl RegistrationStore for Faulty {
     fn insert(&self, registration: Registration) -> BoxFuture<'_, Result<Registration, BoxError>> {
         self.store.insert(registration)
     }
-    fn update<'a>(&'a self, registration: &'a Registration) -> BoxFuture<'a, Result<(), BoxError>> {
-        self.store.update(registration)
+    fn lease<'a>(
+        &'a self,
+        client_id: &'a str,
+        lease: &'a Lease,
+        now: u64,
+    ) -> BoxFuture<'a, Result<Option<Leased>, BoxError>> {
+        self.store.lease(client_id, lease, now)
+    }
+    fn update<'a>(
+        &'a self,
+        registration: &'a Registration,
+        lease: &'a Lease,
+    ) -> BoxFuture<'a, Result<bool, BoxError>> {
+        self.store.update(registration, lease)
+    }
+    fn release<'a>(&'a self, client_id: &'a str, lease: &'a Lease) -> BoxFuture<'a, Result<(), BoxError>> {
+        self.store.release(client_id, lease)
     }
     fn touch<'a>(&'a self, client_id: &'a str, at: u64) -> BoxFuture<'a, Result<(), BoxError>> {
         if self.touch_fails.load(Ordering::SeqCst) {
@@ -514,12 +559,8 @@ impl RegistrationStore for Faulty {
     fn list(&self) -> BoxFuture<'_, Result<Vec<Registration>, BoxError>> {
         Box::pin(async {
             let listed = self.store.list().await;
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
             if let Some(client) = &self.used_after_list {
-                self.store.touch(client, now).await?;
+                self.store.touch(client, now()).await?;
             }
             listed
         })
@@ -591,4 +632,1016 @@ async fn cleanup_keeps_a_client_whose_first_use_failed_to_record() {
     let report = server.registrar.cleanup().await.unwrap();
     assert_eq!(report.unused, 0, "a client in use is not unused");
     assert_eq!(server.store.registrations().len(), 1);
+}
+
+/// While holding, every app-client and store call that a [`Held`] server
+/// makes waits until the test lets it go, so a test can step through a
+/// refresh, or run two in any order. A call named by [`fail`](Self::fail)
+/// fails, as a throttled AWS call does.
+#[derive(Clone, Default)]
+struct Steps(Arc<Calls>);
+
+#[derive(Default)]
+struct Calls {
+    holding: AtomicBool,
+    held: Mutex<Vec<(&'static str, oneshot::Sender<()>)>>,
+    failing: Mutex<Option<&'static str>>,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("throttled")]
+struct Throttled;
+
+impl From<Throttled> for AdminError {
+    fn from(throttled: Throttled) -> Self {
+        AdminError::Other(Arc::new(throttled.into()))
+    }
+}
+
+impl Steps {
+    fn hold(&self) {
+        self.0.holding.store(true, Ordering::SeqCst);
+    }
+
+    fn fail(&self, call: &'static str) {
+        *self.0.failing.lock().unwrap() = Some(call);
+    }
+
+    async fn wait(&self, call: &'static str) -> Result<(), Throttled> {
+        if self.0.holding.load(Ordering::SeqCst) {
+            let (go, gone) = oneshot::channel();
+            self.0.held.lock().unwrap().push((call, go));
+            let _ = gone.await;
+        }
+        match *self.0.failing.lock().unwrap() {
+            Some(failing) if failing == call => Err(Throttled),
+            _ => Ok(()),
+        }
+    }
+
+    /// The names of the calls held now.
+    fn held(&self) -> Vec<&'static str> {
+        self.0
+            .held
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(call, _)| *call)
+            .collect()
+    }
+
+    /// Waits until each task has a call held or has finished, and returns
+    /// whether a call is held.
+    async fn settle<T>(&self, tasks: &[JoinHandle<T>]) -> bool {
+        loop {
+            let held = self.0.held.lock().unwrap().len();
+            if held + tasks.iter().filter(|t| t.is_finished()).count() == tasks.len() {
+                return held > 0;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Lets the held call that `order` picks go.
+    fn release(&self, order: &Order) {
+        let mut held = self.0.held.lock().unwrap();
+        let pick = if held.len() > 1 { order.pick(held.len()) } else { 0 };
+        let _ = held.remove(pick).1.send(());
+    }
+
+    /// Lets held calls go until the one held is `call`.
+    async fn run_to<T>(&self, tasks: &[JoinHandle<T>], call: &str) {
+        while self.settle(tasks).await && self.held() != [call] {
+            self.release(&Order::default());
+        }
+        assert_eq!(self.held(), [call]);
+    }
+
+    /// Lets held calls go until the tasks finish.
+    async fn run_out<T>(&self, tasks: &[JoinHandle<T>]) {
+        while self.settle(tasks).await {
+            self.release(&Order::default());
+        }
+    }
+}
+
+/// The choices one run makes among held calls: those in `prefix`, then the
+/// first. `taken` records each choice and how many there were.
+#[derive(Clone, Default)]
+struct Order(Arc<Mutex<Choices>>);
+
+#[derive(Default)]
+struct Choices {
+    prefix: Vec<usize>,
+    taken: Vec<(usize, usize)>,
+}
+
+impl Order {
+    fn pick(&self, of: usize) -> usize {
+        let mut choices = self.0.lock().unwrap();
+        let chosen = choices.prefix.get(choices.taken.len()).copied().unwrap_or(0);
+        choices.taken.push((chosen, of));
+        chosen
+    }
+
+    fn taken(&self) -> Vec<(usize, usize)> {
+        self.0.lock().unwrap().taken.clone()
+    }
+}
+
+/// Runs `scenario` once for each order in which its held calls can go, and
+/// returns how many orders there were.
+async fn every_order<F: Future<Output = ()>>(scenario: impl Fn(Order) -> F) -> usize {
+    let mut prefix = Vec::new();
+    let mut runs = 0;
+    loop {
+        let order = Order(Arc::new(Mutex::new(Choices {
+            prefix,
+            taken: Vec::new(),
+        })));
+        scenario(order.clone()).await;
+        runs += 1;
+        let taken = order.taken();
+        let Some(last) = taken.iter().rposition(|&(chosen, of)| chosen + 1 < of) else {
+            return runs;
+        };
+        prefix = taken[..last]
+            .iter()
+            .map(|&(chosen, _)| chosen)
+            .chain([taken[last].0 + 1])
+            .collect();
+    }
+}
+
+/// One server's view of a pool and store that others share, with its calls
+/// held at `steps`, and its clock `ahead` of the others' by that many
+/// seconds.
+#[derive(Clone)]
+struct Held {
+    cognito: FakeCognito,
+    store: MemoryStore,
+    steps: Steps,
+    ahead: u64,
+}
+
+impl AppClients for Held {
+    fn create<'a>(
+        &'a self,
+        name: &'a str,
+        callback_urls: &'a [String],
+    ) -> BoxFuture<'a, Result<ClientId, AdminError>> {
+        Box::pin(async move {
+            self.steps.wait("create").await?;
+            self.cognito.create(name, callback_urls).await
+        })
+    }
+    fn callback_urls<'a>(&'a self, client: &'a ClientId) -> BoxFuture<'a, Result<Vec<String>, AdminError>> {
+        Box::pin(async move {
+            self.steps.wait("callback_urls").await?;
+            self.cognito.callback_urls(client).await
+        })
+    }
+    fn set_callback_urls<'a>(
+        &'a self,
+        client: &'a ClientId,
+        urls: &'a [String],
+    ) -> BoxFuture<'a, Result<(), AdminError>> {
+        Box::pin(async move {
+            self.steps.wait("set_callback_urls").await?;
+            self.cognito.set_callback_urls(client, urls).await
+        })
+    }
+    fn delete<'a>(&'a self, client: &'a ClientId) -> BoxFuture<'a, Result<(), AdminError>> {
+        Box::pin(async move {
+            self.steps.wait("delete").await?;
+            self.cognito.delete(client).await
+        })
+    }
+    fn list<'a>(&'a self, prefix: &'a str) -> BoxFuture<'a, Result<Vec<ClientId>, AdminError>> {
+        Box::pin(async move {
+            self.steps.wait("list").await?;
+            self.cognito.list(prefix).await
+        })
+    }
+    fn created<'a>(&'a self, client: &'a ClientId) -> BoxFuture<'a, Result<SystemTime, AdminError>> {
+        Box::pin(async move {
+            self.steps.wait("created").await?;
+            self.cognito.created(client).await
+        })
+    }
+}
+
+impl RegistrationStore for Held {
+    fn get<'a>(&'a self, client_id: &'a str) -> BoxFuture<'a, Result<Option<Registration>, BoxError>> {
+        Box::pin(async move {
+            self.steps.wait("get").await?;
+            self.store.get(client_id).await
+        })
+    }
+    fn get_by_app_client<'a>(
+        &'a self,
+        app_client: &'a ClientId,
+    ) -> BoxFuture<'a, Result<Option<Registration>, BoxError>> {
+        Box::pin(async move {
+            self.steps.wait("get_by_app_client").await?;
+            self.store.get_by_app_client(app_client).await
+        })
+    }
+    fn insert(&self, registration: Registration) -> BoxFuture<'_, Result<Registration, BoxError>> {
+        Box::pin(async move {
+            self.steps.wait("insert").await?;
+            self.store.insert(registration).await
+        })
+    }
+    fn lease<'a>(
+        &'a self,
+        client_id: &'a str,
+        lease: &'a Lease,
+        now: u64,
+    ) -> BoxFuture<'a, Result<Option<Leased>, BoxError>> {
+        Box::pin(async move {
+            self.steps.wait("lease").await?;
+            let lease = Lease::new(lease.owner.clone(), lease.until + self.ahead);
+            self.store.lease(client_id, &lease, now + self.ahead).await
+        })
+    }
+    fn update<'a>(
+        &'a self,
+        registration: &'a Registration,
+        lease: &'a Lease,
+    ) -> BoxFuture<'a, Result<bool, BoxError>> {
+        Box::pin(async move {
+            self.steps.wait("update").await?;
+            self.store.update(registration, lease).await
+        })
+    }
+    fn release<'a>(&'a self, client_id: &'a str, lease: &'a Lease) -> BoxFuture<'a, Result<(), BoxError>> {
+        Box::pin(async move {
+            self.steps.wait("release").await?;
+            self.store.release(client_id, lease).await
+        })
+    }
+    fn touch<'a>(&'a self, client_id: &'a str, at: u64) -> BoxFuture<'a, Result<(), BoxError>> {
+        Box::pin(async move {
+            self.steps.wait("touch").await?;
+            self.store.touch(client_id, at).await
+        })
+    }
+    fn remove<'a>(&'a self, registration: &'a Registration) -> BoxFuture<'a, Result<(), BoxError>> {
+        Box::pin(async move {
+            self.steps.wait("remove").await?;
+            self.store.remove(registration).await
+        })
+    }
+    fn list(&self) -> BoxFuture<'_, Result<Vec<Registration>, BoxError>> {
+        Box::pin(async move {
+            self.steps.wait("list").await?;
+            self.store.list().await
+        })
+    }
+}
+
+/// A pool and store that several servers share, with Claude registered by
+/// a document listing `CLAUDE_CALLBACK`.
+async fn shared_pool() -> (FakeCognito, MemoryStore) {
+    let cognito = FakeCognito::new();
+    let store = MemoryStore::new();
+    let first = sharing(&cognito, &store, &Steps::default(), &[CLAUDE_CALLBACK]);
+    sign_in(&first, &claude(CLAUDE_CALLBACK)).await.unwrap();
+    (cognito, store)
+}
+
+/// Makes Claude's stored document due for a refresh.
+fn due(store: &MemoryStore) {
+    store.edit(CLAUDE, |r| r.fetched_at -= 600);
+}
+
+/// A server on `cognito` and `store` whose calls `steps` holds, fetching
+/// Claude's document with `redirect_uris`.
+fn sharing(cognito: &FakeCognito, store: &MemoryStore, steps: &Steps, redirect_uris: &[&str]) -> Server {
+    let held = Held {
+        cognito: cognito.clone(),
+        store: store.clone(),
+        steps: steps.clone(),
+        ahead: 0,
+    };
+    on(held, redirect_uris)
+}
+
+/// A server on `cognito` and `store` whose clock reads `seconds` later than
+/// the others'. An hour later, every lease they took has run out for it.
+fn later_by(seconds: u64, cognito: &FakeCognito, store: &MemoryStore, redirect_uris: &[&str]) -> Server {
+    let held = Held {
+        cognito: cognito.clone(),
+        store: store.clone(),
+        steps: Steps::default(),
+        ahead: seconds,
+    };
+    on(held, redirect_uris)
+}
+
+/// A server over `held`, fetching Claude's document with `redirect_uris`.
+fn on(held: Held, redirect_uris: &[&str]) -> Server {
+    let documents = Documents::default();
+    documents.serve(CLAUDE, &claude_document(redirect_uris));
+    fetching(held, documents.clone(), documents)
+}
+
+/// A server over `held` that fetches with `fetcher`.
+fn fetching(held: Held, documents: Documents, fetcher: impl FetchDocument) -> Server {
+    let (cognito, store) = (held.cognito.clone(), held.store.clone());
+    let registrar = Registrar::builder(held.clone(), held)
+        .fetcher(fetcher)
+        .dynamic_registration()
+        .client_hosts(["claude.ai"])
+        .build()
+        .unwrap();
+    serve(cognito, store, documents, registrar)
+}
+
+/// A document host whose answer takes two seconds to arrive, with the
+/// document as it was when the fetch began. `began` is told when it does.
+#[derive(Clone)]
+struct Slow {
+    documents: Documents,
+    began: Arc<Notify>,
+}
+
+impl FetchDocument for Slow {
+    fn fetch<'a>(&'a self, url: &'a Url) -> BoxFuture<'a, Result<Vec<u8>, FetchError>> {
+        let answer = self.documents.fetch(url);
+        self.began.notify_one();
+        Box::pin(async move {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            answer.await
+        })
+    }
+}
+
+/// A server like [`sharing`]'s, whose fetches take two seconds.
+fn slow(cognito: &FakeCognito, store: &MemoryStore, steps: &Steps, redirect_uris: &[&str]) -> (Server, Slow) {
+    let held = Held {
+        cognito: cognito.clone(),
+        store: store.clone(),
+        steps: steps.clone(),
+        ahead: 0,
+    };
+    let documents = Documents::default();
+    documents.serve(CLAUDE, &claude_document(redirect_uris));
+    let fetcher = Slow {
+        documents: documents.clone(),
+        began: Arc::default(),
+    };
+    (fetching(held, documents, fetcher.clone()), fetcher)
+}
+
+/// Claude's authorization at `server` with `redirect_uri`, on its own task.
+fn authorize(server: Server, redirect_uri: &'static str) -> JoinHandle<http::Response<String>> {
+    tokio::spawn(async move { get(&server.front, &authorize_url(CLAUDE, redirect_uri, true)).await })
+}
+
+fn stored(store: &MemoryStore) -> Option<Registration> {
+    store.registrations().into_iter().find(|r| r.client_id == CLAUDE)
+}
+
+/// The callback URLs of Claude's app client.
+fn callbacks(cognito: &FakeCognito, store: &MemoryStore) -> Vec<String> {
+    let app_client = stored(store).expect("Claude is registered").app_client;
+    let found = cognito.app_clients().into_iter().find(|c| c.id == app_client);
+    found.map(|c| c.callback_urls).unwrap_or_default()
+}
+
+/// The app client an authorization sends the browser to managed login with.
+fn app_client_of(at_login: &Url) -> String {
+    let found = at_login.query_pairs().find(|(name, _)| name == "client_id");
+    found.expect("a client_id").1.into_owned()
+}
+
+/// Whether Cognito allows every redirect URI the store lists for Claude:
+/// the check a sign-in meets at managed login after the front sends it on.
+fn allowed(cognito: &FakeCognito, store: &MemoryStore) -> bool {
+    let callbacks = callbacks(cognito, store);
+    stored(store)
+        .unwrap()
+        .redirect_uris
+        .iter()
+        .all(|uri| callbacks.contains(uri))
+}
+
+/// Registers a client on `server`, an app-client write that counts against
+/// the ten a minute it may make, and returns the answer's status.
+async fn register_one(server: &Server) -> StatusCode {
+    let answer = post_json(
+        &server.front,
+        REGISTER,
+        &registration(&["http://127.0.0.1:9000/cb"]),
+    )
+    .await;
+    answer.status()
+}
+
+#[tokio::test]
+async fn a_sign_in_meets_its_redirect_uri_at_cognito_whatever_step_a_refresh_is_at() {
+    for writes_left in [10, 1, 0] {
+        let (cognito, store) = shared_pool().await;
+        let steps = Steps::default();
+        let refreshing = sharing(&cognito, &store, &steps, &[MOVED]);
+        let other = sharing(&cognito, &store, &Steps::default(), &[MOVED]);
+        for _ in writes_left..10 {
+            assert_eq!(register_one(&refreshing).await, StatusCode::CREATED);
+        }
+        // Someone who began signing in before Claude moved its callback is
+        // at managed login while the refresh runs. Only the contraction to
+        // the new list, after the store holds it, refuses them.
+        let answer = get(&other.front, &authorize_url(CLAUDE, CLAUDE_CALLBACK, true)).await;
+        let at_login = location(&answer).unwrap();
+        due(&store);
+
+        steps.hold();
+        let refresh = [authorize(refreshing, MOVED)];
+        while steps.settle(&refresh).await {
+            if callbacks(&cognito, &store) != [MOVED] {
+                let arrived = cognito.sign_in(&at_login, "6f1c2e7a-user");
+                assert!(arrived.is_ok(), "{writes_left} writes left: {arrived:?}");
+            }
+            // The refresh stored the new callback: a sign-in reads it.
+            if stored(&store).unwrap().redirect_uris == [MOVED] {
+                let signed_in = sign_in(&other, &claude(MOVED)).await;
+                assert!(signed_in.is_ok(), "{writes_left} writes left: {signed_in:?}");
+            }
+            steps.release(&Order::default());
+        }
+        // The sign-in that refreshed goes on to Cognito when a write is left
+        // for the expansion, even with none left for the contraction.
+        let [refresh] = refresh;
+        let expected = if writes_left > 0 {
+            StatusCode::FOUND
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        };
+        assert_eq!(
+            refresh.await.unwrap().status(),
+            expected,
+            "{writes_left} writes left"
+        );
+
+        // Cognito ends with exactly the new list once a refresh with a write
+        // to spare has run.
+        due(&store);
+        let signed_in = sign_in(&other, &claude(MOVED)).await;
+        assert!(signed_in.is_ok(), "{writes_left} writes left: {signed_in:?}");
+        assert_eq!(callbacks(&cognito, &store), [MOVED], "{writes_left} writes left");
+    }
+}
+
+/// Signs in with the redirect URI the store lists for Claude, through a
+/// server that fetches the document as stored, and checks that the
+/// sign-in completes.
+async fn sign_in_as_stored(cognito: &FakeCognito, store: &MemoryStore, context: &str) {
+    let listed = stored(store).unwrap().redirect_uris;
+    let uris: Vec<&str> = listed.iter().map(String::as_str).collect();
+    let server = sharing(cognito, store, &Steps::default(), &uris);
+    let signed_in = sign_in(&server, &claude(uris[0])).await;
+    assert!(signed_in.is_ok(), "{context}: {signed_in:?}");
+}
+
+#[tokio::test]
+async fn two_servers_refreshing_a_changing_document_keep_every_stored_redirect_uri_allowed() {
+    // Their fetches get the same new version, two new ones, or a new one
+    // and a stale copy of the old, as a CDN may serve.
+    for (a, b) in [(MOVED, MOVED), (MOVED, MOVED_AGAIN), (MOVED, CLAUDE_CALLBACK)] {
+        let orders = every_order(|order| async move {
+            let (cognito, store) = shared_pool().await;
+            due(&store);
+            let steps = Steps::default();
+            steps.hold();
+            let refreshes = [
+                authorize(sharing(&cognito, &store, &steps, &[a]), a),
+                authorize(sharing(&cognito, &store, &steps, &[b]), b),
+            ];
+            while steps.settle(&refreshes).await {
+                assert!(allowed(&cognito, &store), "choices {:?}", order.taken());
+                steps.release(&order);
+            }
+            let choices = order.taken();
+            let listed = stored(&store).unwrap().redirect_uris;
+            assert_eq!(callbacks(&cognito, &store), listed, "choices {choices:?}");
+            // A sign-in after both reads the store, not due, and goes on to
+            // managed login.
+            sign_in_as_stored(&cognito, &store, &format!("choices {choices:?}")).await;
+        })
+        .await;
+        assert!(orders > 1, "{orders}");
+    }
+}
+
+#[tokio::test]
+async fn a_refresh_whose_lease_runs_out_leaves_the_document_to_the_one_that_takes_over() {
+    for at in 0.. {
+        let (cognito, store) = shared_pool().await;
+        due(&store);
+        let steps = Steps::default();
+        let slow = sharing(&cognito, &store, &steps, &[MOVED]);
+        let later = later_by(3600, &cognito, &store, &[MOVED_AGAIN]);
+        steps.hold();
+        let refresh = [authorize(slow, MOVED)];
+        let (mut step, mut taken_over) = (0, false);
+        while steps.settle(&refresh).await {
+            let call = steps.held()[0];
+            // Cognito has no conditional write: one that lands after its
+            // lease ran out is the window that the lease's length covers.
+            if step == at && call != "set_callback_urls" {
+                // By the later server's clock, the stored document is due.
+                due(&store);
+                let signed_in = sign_in(&later, &claude(MOVED_AGAIN)).await;
+                assert!(signed_in.is_ok(), "held at {call}: {signed_in:?}");
+                taken_over = true;
+            }
+            step += 1;
+            steps.release(&Order::default());
+        }
+        if step <= at {
+            break;
+        }
+        assert!(allowed(&cognito, &store), "held at call {at}");
+        if taken_over {
+            let listed = stored(&store).unwrap().redirect_uris;
+            assert_eq!(listed, [MOVED_AGAIN], "held at call {at}");
+        }
+        sign_in_as_stored(&cognito, &store, &format!("held at call {at}")).await;
+        // The next refresh leaves Cognito exactly the stored list.
+        due(&store);
+        sign_in_as_stored(&cognito, &store, &format!("held at call {at}")).await;
+        let listed = stored(&store).unwrap().redirect_uris;
+        assert_eq!(callbacks(&cognito, &store), listed, "held at call {at}");
+    }
+}
+
+#[tokio::test]
+async fn a_refresh_leaves_alone_a_registration_made_again_while_it_ran() {
+    for at in 0.. {
+        let (cognito, store) = shared_pool().await;
+        due(&store);
+        store.edit(CLAUDE, |r| r.last_used = Some(1));
+        let steps = Steps::default();
+        let refreshing = sharing(&cognito, &store, &steps, &[MOVED]);
+        let other = sharing(&cognito, &store, &Steps::default(), &[MOVED_AGAIN]);
+        steps.hold();
+        let refresh = [authorize(refreshing, MOVED)];
+        let (mut step, mut at_login) = (0, None);
+        while steps.settle(&refresh).await {
+            if step == at {
+                // Cleanup removes the idle registration and deletes its app
+                // client. The next sign-in registers Claude again, from the
+                // document as it is now, and goes on to managed login.
+                assert_eq!(other.registrar.cleanup().await.unwrap().idle, 1);
+                let answer = get(&other.front, &authorize_url(CLAUDE, MOVED_AGAIN, true)).await;
+                at_login = location(&answer);
+            }
+            step += 1;
+            steps.release(&Order::default());
+        }
+        if step <= at {
+            break;
+        }
+        // Whichever call the refresh was at, the new registration keeps its
+        // list. The user it sent on signs in, and so do the next ones.
+        let context = format!("held at call {at}");
+        assert_eq!(stored(&store).unwrap().redirect_uris, [MOVED_AGAIN], "{context}");
+        assert_eq!(callbacks(&cognito, &store), [MOVED_AGAIN], "{context}");
+        let at_login = at_login.expect("sent on to managed login");
+        let arrived = cognito.sign_in(&at_login, "6f1c2e7a-user");
+        assert!(arrived.is_ok(), "{context}: {arrived:?}");
+        let signed_in = sign_in(&other, &claude(MOVED_AGAIN)).await;
+        assert!(signed_in.is_ok(), "{context}: {signed_in:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_slow_fetch_leaves_the_document_that_a_refresh_begun_after_it_stored() {
+    let (cognito, store) = shared_pool().await;
+    due(&store);
+    // A server's fetch reads the document while it lists MOVED, and the
+    // answer takes two seconds to arrive.
+    let (server, fetcher) = slow(&cognito, &store, &Steps::default(), &[MOVED]);
+    let late = authorize(server, MOVED);
+    fetcher.began.notified().await;
+
+    // Meanwhile the document moves on, another server refreshes it, and a
+    // user goes on to managed login.
+    let other = sharing(&cognito, &store, &Steps::default(), &[MOVED_AGAIN]);
+    let answer = get(&other.front, &authorize_url(CLAUDE, MOVED_AGAIN, true)).await;
+    let at_login = location(&answer).expect("sent on to managed login");
+    assert_eq!(late.await.unwrap().status(), StatusCode::BAD_REQUEST);
+
+    assert_eq!(stored(&store).unwrap().redirect_uris, [MOVED_AGAIN]);
+    assert_eq!(callbacks(&cognito, &store), [MOVED_AGAIN]);
+    let arrived = cognito.sign_in(&at_login, "6f1c2e7a-user");
+    assert!(arrived.is_ok(), "{arrived:?}");
+    let signed_in = sign_in(&other, &claude(MOVED_AGAIN)).await;
+    assert!(signed_in.is_ok(), "{signed_in:?}");
+}
+
+#[tokio::test]
+async fn a_lease_lasts_thirty_seconds_from_when_it_is_taken_however_long_the_fetch_took() {
+    let (cognito, store) = shared_pool().await;
+    due(&store);
+    let steps = Steps::default();
+    steps.hold();
+    let (server, _) = slow(&cognito, &store, &steps, &[CLAUDE_CALLBACK]);
+    let refresh = [authorize(server, CLAUDE_CALLBACK)];
+    steps.run_to(&refresh, "callback_urls").await;
+
+    // By another server's clock, the lease was taken 28 seconds ago, and
+    // then 31. Each needs the document refreshed for its sign-in.
+    due(&store);
+    let answer = get(
+        &later_by(28, &cognito, &store, &[MOVED]).front,
+        &authorize_url(CLAUDE, MOVED, true),
+    )
+    .await;
+    assert_eq!(answer.status(), StatusCode::SERVICE_UNAVAILABLE, "still leased");
+    let signed_in = sign_in(&later_by(31, &cognito, &store, &[MOVED]), &claude(MOVED)).await;
+    assert!(signed_in.is_ok(), "run out: {signed_in:?}");
+    steps.run_out(&refresh).await;
+}
+
+#[tokio::test]
+async fn a_sign_in_whose_fetch_outlasted_cleanup_goes_through_the_current_app_client() {
+    // After cleanup, nobody registers Claude again, another server does, or
+    // another server does and is refreshing it.
+    for (again, refreshing) in [(false, false), (true, false), (true, true)] {
+        let context = format!("registered again {again}, refreshing {refreshing}");
+        let (cognito, store) = shared_pool().await;
+        due(&store);
+        store.edit(CLAUDE, |r| r.last_used = Some(1));
+        let steps = Steps::default();
+        steps.hold();
+        let slow = [authorize(
+            sharing(&cognito, &store, &steps, &[CLAUDE_CALLBACK]),
+            CLAUDE_CALLBACK,
+        )];
+        steps.run_to(&slow, "lease").await;
+
+        let other = sharing(&cognito, &store, &Steps::default(), &[CLAUDE_CALLBACK]);
+        assert_eq!(other.registrar.cleanup().await.unwrap().idle, 1);
+        if again {
+            sign_in(&other, &claude(CLAUDE_CALLBACK)).await.unwrap();
+        }
+        if refreshing {
+            let lease = Lease::new("another server", now() + 30);
+            let leased = store.lease(CLAUDE, &lease, now()).await.unwrap();
+            assert!(matches!(leased, Some(Leased::Taken(_))), "{context}");
+        }
+        steps.run_out(&slow).await;
+        let [slow] = slow;
+        let at_login = location(&slow.await.unwrap()).expect("sent on to managed login");
+        let current = stored(&store).unwrap().app_client;
+        assert_eq!(app_client_of(&at_login), current.as_str(), "{context}");
+        let arrived = cognito.sign_in(&at_login, "6f1c2e7a-user");
+        assert!(arrived.is_ok(), "{context}: {arrived:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_sign_in_that_finds_the_lease_held_goes_on_with_a_redirect_uri_the_holder_stored() {
+    let (cognito, store) = shared_pool().await;
+    due(&store);
+    let waiting_steps = Steps::default();
+    waiting_steps.hold();
+    let waiting = [authorize(
+        sharing(&cognito, &store, &waiting_steps, &[MOVED]),
+        MOVED,
+    )];
+    waiting_steps.run_to(&waiting, "lease").await;
+
+    // Another server's refresh has stored MOVED and still holds the lease.
+    let holder_steps = Steps::default();
+    holder_steps.hold();
+    let holder = [authorize(
+        sharing(&cognito, &store, &holder_steps, &[MOVED]),
+        MOVED,
+    )];
+    holder_steps.run_to(&holder, "release").await;
+    waiting_steps.run_out(&waiting).await;
+    let [waiting] = waiting;
+    let at_login = location(&waiting.await.unwrap()).expect("sent on to managed login");
+    let arrived = cognito.sign_in(&at_login, "6f1c2e7a-user");
+    assert!(arrived.is_ok(), "{arrived:?}");
+    holder_steps.run_out(&holder).await;
+}
+
+#[tokio::test]
+async fn a_refresh_that_stopped_holds_its_document_back_only_until_its_lease_runs_out() {
+    let (cognito, store) = shared_pool().await;
+    due(&store);
+    // A server took the lease to refresh Claude's document, and stopped.
+    let stopped = Lease::new("stopped", now() + 30);
+    let leased = store.lease(CLAUDE, &stopped, now()).await.unwrap();
+    assert!(matches!(leased, Some(Leased::Taken(_))));
+    let server = sharing(&cognito, &store, &Steps::default(), &[CLAUDE_CALLBACK, MOVED]);
+
+    // The stored redirect URI goes on to managed login. The one only the
+    // new document lists is told to try again, and nothing is sent to it.
+    let signed_in = sign_in(&server, &claude(CLAUDE_CALLBACK)).await;
+    assert!(signed_in.is_ok(), "{signed_in:?}");
+    let answer = get(&server.front, &authorize_url(CLAUDE, MOVED, true)).await;
+    assert_eq!(answer.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(location(&answer), None);
+    assert_eq!(stored(&store).unwrap().redirect_uris, [CLAUDE_CALLBACK]);
+
+    // Once the lease has run out, the next sign-in refreshes the document.
+    let later = later_by(3600, &cognito, &store, &[CLAUDE_CALLBACK, MOVED]);
+    let signed_in = sign_in(&later, &claude(MOVED)).await;
+    assert!(signed_in.is_ok(), "{signed_in:?}");
+    let mut allowed = callbacks(&cognito, &store);
+    allowed.sort();
+    assert_eq!(allowed, [CLAUDE_CALLBACK, MOVED]);
+}
+
+/// A document host that is down.
+struct Down;
+
+impl FetchDocument for Down {
+    fn fetch<'a>(&'a self, _: &'a Url) -> BoxFuture<'a, Result<Vec<u8>, FetchError>> {
+        Box::pin(async { Err(FetchError::Status(503)) })
+    }
+}
+
+#[tokio::test]
+async fn while_the_document_host_is_down_a_refresh_gives_cognito_the_stored_redirect_uris() {
+    let (cognito, store) = shared_pool().await;
+    // Cognito lacks the stored callback and has another, as crossing
+    // refreshes of earlier releases could leave it.
+    let app_client = stored(&store).unwrap().app_client;
+    cognito
+        .set_callback_urls(&app_client, &[MOVED.to_owned()])
+        .await
+        .unwrap();
+    due(&store);
+    let registrar = Registrar::builder(cognito.clone(), store.clone())
+        .fetcher(Down)
+        .client_hosts(["claude.ai"])
+        .build()
+        .unwrap();
+    let server = serve(cognito.clone(), store.clone(), Documents::default(), registrar);
+    let signed_in = sign_in(&server, &claude(CLAUDE_CALLBACK)).await;
+    assert!(signed_in.is_ok(), "{signed_in:?}");
+    assert_eq!(callbacks(&cognito, &store), [CLAUDE_CALLBACK]);
+}
+
+#[tokio::test]
+async fn while_the_document_host_is_down_a_sign_in_is_not_sent_through_an_app_client_cleanup_deleted() {
+    // The refresh holds the lease when cleanup removes the registration,
+    // before it reads the app client or before it stores.
+    for call in ["callback_urls", "update"] {
+        let (cognito, store) = shared_pool().await;
+        due(&store);
+        store.edit(CLAUDE, |r| r.last_used = Some(1));
+        let steps = Steps::default();
+        let held = Held {
+            cognito: cognito.clone(),
+            store: store.clone(),
+            steps: steps.clone(),
+            ahead: 0,
+        };
+        let down = fetching(held, Documents::default(), Down);
+        steps.hold();
+        let refresh = [authorize(down, CLAUDE_CALLBACK)];
+        steps.run_to(&refresh, call).await;
+
+        let other = sharing(&cognito, &store, &Steps::default(), &[CLAUDE_CALLBACK]);
+        assert_eq!(other.registrar.cleanup().await.unwrap().idle, 1, "{call}");
+        steps.run_out(&refresh).await;
+        let [refresh] = refresh;
+        let answer = refresh.await.unwrap();
+        assert_eq!(answer.status(), StatusCode::SERVICE_UNAVAILABLE, "{call}");
+        assert_eq!(location(&answer), None, "{call}");
+    }
+}
+
+#[tokio::test]
+async fn a_document_at_cognitos_limit_of_100_callback_urls_can_swap_one() {
+    let server = open_server();
+    let old: Vec<String> = (0..100)
+        .map(|i| format!("https://claude.ai/callback/{i}"))
+        .collect();
+    let mut new = old.clone();
+    new[99] = "https://claude.ai/callback/new".into();
+    let document = |uris: &[String]| claude_document(&uris.iter().map(String::as_str).collect::<Vec<_>>());
+    server.documents.serve(CLAUDE, &document(&old));
+    sign_in(&server, &claude(&old[0])).await.unwrap();
+
+    server.documents.serve(CLAUDE, &document(&new));
+    due(&server.store);
+    for uri in [&old[0], &new[99]] {
+        let signed_in = sign_in(&server, &claude(uri)).await;
+        assert!(signed_in.is_ok(), "{uri}: {signed_in:?}");
+    }
+    let mut allowed = callbacks(&server.cognito, &server.store);
+    allowed.sort();
+    new.sort();
+    assert_eq!(allowed, new);
+}
+
+fn uris(uris: &[String]) -> Vec<&str> {
+    uris.iter().map(String::as_str).collect()
+}
+
+#[tokio::test]
+async fn at_cognitos_limit_a_swap_the_store_misses_sends_on_only_what_cognito_and_the_store_list() {
+    // 99 web callbacks and a loopback one, which Cognito knows as the relay.
+    let mut old: Vec<String> = (0..99)
+        .map(|i| format!("https://claude.ai/callback/{i}"))
+        .collect();
+    old.push("http://127.0.0.1:1111/callback".into());
+    let mut new = old.clone();
+    new[98] = "https://claude.ai/callback/new".into();
+    new[99] = "http://127.0.0.1:2222/callback".into();
+    let (cognito, store) = (FakeCognito::new(), MemoryStore::new());
+    let first = sharing(&cognito, &store, &Steps::default(), &uris(&old));
+    sign_in(&first, &claude(&old[0])).await.unwrap();
+    due(&store);
+    let steps = Steps::default();
+    steps.fail("update");
+    let server = sharing(&cognito, &store, &steps, &uris(&new));
+    // Cognito gets the new list alone before the store, which fails.
+    // Cognito no longer allows the dropped URI, and token redemption reads
+    // the store, which doesn't list the added one yet.
+    for uri in [&old[98], &new[98]] {
+        let answer = get(&server.front, &authorize_url(CLAUDE, uri, true)).await;
+        assert_eq!(location(&answer), None, "{uri} is never sent on");
+    }
+    let signed_in = sign_in(&server, &claude(&old[0])).await;
+    assert!(signed_in.is_ok(), "{signed_in:?}");
+    // A loopback redirect URI matches on any port, in both lists.
+    let answer = get(
+        &server.front,
+        &authorize_url(CLAUDE, "http://127.0.0.1:3333/callback", true),
+    )
+    .await;
+    assert_eq!(answer.status(), StatusCode::FOUND, "{}", answer.body());
+}
+
+#[tokio::test]
+async fn a_refresh_never_leaves_a_host_no_longer_trusted_in_cognito_alone() {
+    const CHATGPT_CALLBACK: &str = "https://chatgpt.com/connector/oauth/callback";
+    let (cognito, store, documents) = (FakeCognito::new(), MemoryStore::new(), Documents::default());
+    documents.serve(CLAUDE, &claude_document(&[CLAUDE_CALLBACK, CHATGPT_CALLBACK]));
+    let trusting = |hosts: &[&'static str]| {
+        let registrar = Registrar::builder(cognito.clone(), store.clone())
+            .fetcher(documents.clone())
+            .dynamic_registration()
+            .client_hosts(hosts.to_vec())
+            .build()
+            .unwrap();
+        serve(cognito.clone(), store.clone(), documents.clone(), registrar)
+    };
+    sign_in(&trusting(&["claude.ai", "chatgpt.com"]), &claude(CLAUDE_CALLBACK))
+        .await
+        .unwrap();
+
+    // The operator stops trusting chatgpt.com, and the minute's app-client
+    // writes run out before the next refresh.
+    let server = trusting(&["claude.ai"]);
+    while register_one(&server).await == StatusCode::CREATED {}
+    due(&store);
+    let _ = sign_in(&server, &claude(CLAUDE_CALLBACK)).await;
+    // Cleanup removes a registration whose stored document names the host.
+    trusting(&["claude.ai"]).registrar.cleanup().await.unwrap();
+    let kept: Vec<String> = cognito
+        .app_clients()
+        .into_iter()
+        .flat_map(|c| c.callback_urls)
+        .collect();
+    assert!(!kept.iter().any(|c| c == CHATGPT_CALLBACK), "{kept:?}");
+}
+
+#[tokio::test]
+async fn while_the_document_host_is_down_a_refresh_gives_cognito_no_host_no_longer_trusted() {
+    const CHATGPT_CALLBACK: &str = "https://chatgpt.com/connector/oauth/callback";
+    let (cognito, store, documents) = (FakeCognito::new(), MemoryStore::new(), Documents::default());
+    documents.serve(CLAUDE, &claude_document(&[CLAUDE_CALLBACK, CHATGPT_CALLBACK]));
+    let registrar = Registrar::builder(cognito.clone(), store.clone())
+        .fetcher(documents.clone())
+        .client_hosts(["claude.ai", "chatgpt.com"])
+        .build()
+        .unwrap();
+    let both = serve(cognito.clone(), store.clone(), documents.clone(), registrar);
+    sign_in(&both, &claude(CLAUDE_CALLBACK)).await.unwrap();
+    // Cognito has a callback the store doesn't, so the refresh contracts.
+    let app_client = stored(&store).unwrap().app_client;
+    let drifted = [CLAUDE_CALLBACK, CHATGPT_CALLBACK, MOVED].map(str::to_owned);
+    cognito.set_callback_urls(&app_client, &drifted).await.unwrap();
+
+    // The operator stops trusting chatgpt.com, and the host is down.
+    due(&store);
+    let registrar = Registrar::builder(cognito.clone(), store.clone())
+        .fetcher(Down)
+        .client_hosts(["claude.ai"])
+        .build()
+        .unwrap();
+    let server = serve(cognito.clone(), store.clone(), Documents::default(), registrar);
+    let signed_in = sign_in(&server, &claude(CLAUDE_CALLBACK)).await;
+    assert!(signed_in.is_ok(), "{signed_in:?}");
+    assert_eq!(callbacks(&cognito, &store), [CLAUDE_CALLBACK]);
+    // The store still names the host, so cleanup finds it.
+    assert!(
+        stored(&store)
+            .unwrap()
+            .redirect_uris
+            .iter()
+            .any(|u| u == CHATGPT_CALLBACK)
+    );
+}
+
+#[tokio::test]
+async fn a_sign_in_is_not_sent_through_an_app_client_cleanup_deleted_before_the_refresh_contracted() {
+    let (cognito, store) = (FakeCognito::new(), MemoryStore::new());
+    let first = sharing(&cognito, &store, &Steps::default(), &[CLAUDE_CALLBACK, MOVED]);
+    sign_in(&first, &claude(CLAUDE_CALLBACK)).await.unwrap();
+    due(&store);
+    store.edit(CLAUDE, |r| r.last_used = Some(1));
+    let steps = Steps::default();
+    let server = sharing(&cognito, &store, &steps, &[CLAUDE_CALLBACK]);
+    steps.hold();
+    // Dropping MOVED needs no expansion, so the one Cognito write is the
+    // contraction, after the store write.
+    let refresh = [authorize(server, CLAUDE_CALLBACK)];
+    steps.run_to(&refresh, "set_callback_urls").await;
+
+    let other = sharing(&cognito, &store, &Steps::default(), &[CLAUDE_CALLBACK]);
+    assert_eq!(other.registrar.cleanup().await.unwrap().idle, 1);
+    steps.run_out(&refresh).await;
+    let [refresh] = refresh;
+    let answer = refresh.await.unwrap();
+    assert_eq!(answer.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(location(&answer), None);
+}
+
+#[tokio::test]
+async fn a_document_due_for_a_refresh_signs_in_with_no_app_client_writes_left() {
+    let server = open_server();
+    server
+        .documents
+        .serve(CLAUDE, &claude_document(&[CLAUDE_CALLBACK]));
+    sign_in(&server, &claude(CLAUDE_CALLBACK)).await.unwrap();
+    while register_one(&server).await == StatusCode::CREATED {}
+    due(&server.store);
+    let fetches = server.documents.fetches();
+    let signed_in = sign_in(&server, &claude(CLAUDE_CALLBACK)).await;
+    assert!(signed_in.is_ok(), "{signed_in:?}");
+    assert_eq!(server.documents.fetches(), fetches + 1, "refreshed");
+}
+
+/// When `call` fails a due refresh, as a throttled AWS call does, and
+/// whether the document is unchanged, adds or swaps a redirect URI or can't
+/// be fetched, a sign-in with the stored redirect URI completes. One with a
+/// redirect URI only the new document lists is told to try again.
+async fn signs_in_while_failing(call: &'static str) {
+    for document in [
+        Some(&[CLAUDE_CALLBACK][..]),
+        Some(&[CLAUDE_CALLBACK, MOVED]),
+        Some(&[MOVED]),
+        None,
+    ] {
+        let context = format!("{call} fails, document {document:?}");
+        let (cognito, store) = shared_pool().await;
+        due(&store);
+        let steps = Steps::default();
+        steps.fail(call);
+        let server = match document {
+            Some(uris) => sharing(&cognito, &store, &steps, uris),
+            None => {
+                let held = Held {
+                    cognito: cognito.clone(),
+                    store: store.clone(),
+                    steps,
+                    ahead: 0,
+                };
+                fetching(held, Documents::default(), Down)
+            }
+        };
+        let signed_in = sign_in(&server, &claude(CLAUDE_CALLBACK)).await;
+        assert!(signed_in.is_ok(), "{context}: {signed_in:?}");
+        if document.is_some_and(|uris| uris.contains(&MOVED)) {
+            let answer = get(&server.front, &authorize_url(CLAUDE, MOVED, true)).await;
+            assert_eq!(answer.status(), StatusCode::SERVICE_UNAVAILABLE, "{context}");
+            assert_eq!(location(&answer), None, "{context}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_due_sign_in_with_a_stored_redirect_uri_completes_while_cognito_fails() {
+    for call in ["callback_urls", "set_callback_urls"] {
+        signs_in_while_failing(call).await;
+    }
+}
+
+#[tokio::test]
+async fn a_due_sign_in_with_a_stored_redirect_uri_completes_while_the_store_fails() {
+    for call in ["lease", "update"] {
+        signs_in_while_failing(call).await;
+    }
 }
